@@ -22,8 +22,7 @@ class VersionedVault:
         version=sum(1 for _ in self.log.open(encoding="utf-8"))+1 if self.log.exists() else 1
         item={"version":version,"name":name,"value":value}; item["digest"]=self._digest(item)
         self.root.mkdir(parents=True,exist_ok=True)
-        with self.log.open("a",encoding="utf-8") as f: f.write(json.dumps(item,sort_keys=True)+"
-")
+        with self.log.open("a",encoding="utf-8") as f: f.write(json.dumps(item,sort_keys=True)+"\n")
         self.reload(); return version
     def get(self,name): return self.snapshot[name]["value"]
     def versions(self): return [{"name":k,**v} for k,v in sorted(self.snapshot.items())]
@@ -32,3 +31,5 @@ if __name__=="__main__":
     if a.command=="put": print(v.put(a.name,a.value))
     elif a.command=="get": print(v.get(a.name))
     else: print(json.dumps(v.versions(),ensure_ascii=False,sort_keys=True))
+
+
