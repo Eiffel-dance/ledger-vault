@@ -1,5 +1,15 @@
-import argparse, copy, hashlib, json, math
+import argparse, copy, fcntl, hashlib, json, math, threading
 from pathlib import Path
+
+class VersionConflictError(Exception):
+    # Raised by put_if_version when the active version on disk no longer
+    # matches the version the caller based its update on.  When the name has
+    # never been written, actual_version is None.
+    def __init__(self,name,expected_version,actual_version):
+        self.name=name
+        self.expected_version=expected_version
+        self.actual_version=actual_version
+        super().__init__(name,expected_version,actual_version)
 
 class _State:
     __slots__=("snapshot","records","by_version")
@@ -10,6 +20,9 @@ class VersionedVault:
     def __init__(self, root="vault"):
         self.root=Path(root); self.log=self.root/"versions.jsonl"
         self._state=_State({},(),{})
+        # In-process writers are serialized too: on some local filesystems
+        # flock only arbitrates between processes, not threads in one process.
+        self._write_lock=threading.RLock()
         self.reload()
     @staticmethod
     def _digest(item):
@@ -122,6 +135,70 @@ class VersionedVault:
         state=self._load()
         self._state=state
         return len(state.snapshot)
+    def _append_locked(self,name,value,expected_version):
+        # Shared body of put and put_if_version.  Every argument has already
+        # passed its side-effect-free validation; the in-process lock plus an
+        # exclusive flock serializes the whole revalidate-check-append sequence
+        # so that two conditional writers can never append against the same
+        # base version, as threads or as separate processes.
+        with self._write_lock:
+            if self.log.exists():
+                # A read-only handle is enough to take the lock (flock contends
+                # on the inode, so this also serializes against writers that
+                # opened the log in append mode) and leaves a conditional miss
+                # free of any filesystem side effect.
+                lock_handle=self.log.open("r",encoding="utf-8"); created=False
+            else:
+                # The vault does not exist yet.  Rehearse against the empty
+                # chain BEFORE creating anything, preserving put's rule that an
+                # unstorable value never creates a directory; a conditional
+                # update then necessarily misses (no active version on disk).
+                self._build_line(name,value,1)
+                if expected_version is not None:
+                    raise VersionConflictError(name,expected_version,None)
+                self.root.mkdir(parents=True,exist_ok=True)
+                lock_handle=self.log.open("a",encoding="utf-8"); created=True
+            try:
+                fcntl.flock(lock_handle.fileno(),fcntl.LOCK_EX)
+                # Revalidate the complete chain from disk under the lock so a
+                # new record is only appended when it attaches to the valid
+                # chain and the caller's base version is still active.  Another
+                # writer may have populated a just-created log before this lock
+                # was taken, so the version is always derived here.
+                state=self._load()
+                if expected_version is not None:
+                    active=state.snapshot.get(name)
+                    actual_version=active["version"] if active is not None else None
+                    if actual_version!=expected_version:
+                        # No bytes written and self._state is left untouched.
+                        raise VersionConflictError(name,expected_version,actual_version)
+                version=len(state.records)+1
+                line=self._build_line(name,value,version)
+                if created:
+                    lock_handle.write(line)
+                else:
+                    with self.log.open("a",encoding="utf-8") as f:
+                        f.write(line)
+            finally:
+                # Closing the append handle flushes its bytes before the lock
+                # is released, so any waiter revalidates against a chain that
+                # already includes the new record.
+                lock_handle.close()
+            self.reload(); return version
+    def _build_line(self,name,value,version):
+        item={"version":version,"name":name,"value":value}; item["digest"]=self._digest(item)
+        line=json.dumps(item,sort_keys=True)+"\n"
+        # Rehearse the append: the exact bytes about to be written must parse
+        # as the next record in the chain, reproduce the digest, and reload to
+        # a value equal to the submitted one.  Only then are they written.
+        try:
+            parsed=self._parse_record(line[:-1],version-1)
+        except ValueError:
+            raise TypeError("value is not storable under the vault JSON rules")
+        original={"version":version,"name":name,"value":value}
+        if not self._json_equal(parsed,original):
+            raise TypeError("value is not storable under the vault JSON rules")
+        return line
     def put(self,name,value):
         if not isinstance(name,str) or not name:
             raise ValueError("name required")
@@ -130,25 +207,15 @@ class VersionedVault:
         # (coerced or duplicated keys, NaN/Infinity, tuple arrays) must fail as
         # TypeError without creating a directory, writing bytes, or touching state.
         self._ensure_storable(value)
-        # Revalidate the complete chain from disk so a new record is only
-        # appended when it can attach to the existing valid chain.
-        state=self._load()
-        version=len(state.records)+1
-        item={"version":version,"name":name,"value":value}; item["digest"]=self._digest(item)
-        line=json.dumps(item,sort_keys=True)+"\n"
-        # Rehearse the append: the exact bytes about to be written must parse
-        # as the next record in the chain, reproduce the digest, and reload to
-        # a value equal to the submitted one.  Only then open the log.
-        try:
-            parsed=self._parse_record(line[:-1],version-1)
-        except ValueError:
-            raise TypeError("value is not storable under the vault JSON rules")
-        original={"version":version,"name":name,"value":value}
-        if not self._json_equal(parsed,original):
-            raise TypeError("value is not storable under the vault JSON rules")
-        self.root.mkdir(parents=True,exist_ok=True)
-        with self.log.open("a",encoding="utf-8") as f: f.write(line)
-        self.reload(); return version
+        return self._append_locked(name,value,None)
+    def put_if_version(self,name,expected_version,value):
+        if not isinstance(name,str) or not name:
+            raise ValueError("name required")
+        if not self._is_positive_int(expected_version):
+            raise ValueError("expected_version must be a positive integer")
+        # Same round-trip gate as put, run before any filesystem access.
+        self._ensure_storable(value)
+        return self._append_locked(name,value,expected_version)
     def get(self,name,version=None):
         state=self._state
         if version is None:
@@ -181,6 +248,10 @@ if __name__=="__main__":
                         "mutually exclusive with --value: giving both, or passing text that is "
                         "not a complete JSON document, exits with status 1 without appending a record")
     p.add_argument("--version",type=int)
+    p.add_argument("--if-version",dest="if_version",
+                   help="only for put: append only when the named config's active "
+                        "version equals N; a missing name or a stale N exits with "
+                        "status 1 without writing or printing a version")
     p.add_argument("--json",dest="json_output",action="store_true",
                    help="only affects get: print the value as a single JSON document on stdout "
                         "(sorted object keys, unescaped Unicode), accepted by json.loads; "
@@ -202,7 +273,19 @@ if __name__=="__main__":
                     raise SystemExit(1)
             else:
                 value=a.value
-            print(v.put(a.name,value))
+            if a.if_version is not None:
+                # Parsed by hand so every malformed, zero, negative or
+                # fractional condition exits 1 through the same path as every
+                # other rejected put, without appending or printing anything.
+                try:
+                    expected=int(a.if_version,10)
+                except (ValueError,TypeError):
+                    raise SystemExit(1)
+                if expected<=0:
+                    raise SystemExit(1)
+                print(v.put_if_version(a.name,expected,value))
+            else:
+                print(v.put(a.name,value))
         elif a.command=="get":
             value=v.get(a.name) if a.version is None else v.get(a.name,a.version)
             if a.json_output:
@@ -215,5 +298,5 @@ if __name__=="__main__":
             print(v.active_version(a.name))
         else:
             print(json.dumps(v.history(a.name),ensure_ascii=False,sort_keys=True))
-    except (KeyError,ValueError,TypeError):
+    except (KeyError,ValueError,TypeError,VersionConflictError):
         raise SystemExit(1)
