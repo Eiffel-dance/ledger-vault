@@ -1,4 +1,4 @@
-import json, math, unittest
+import json, math, os, subprocess, sys, threading, unittest
 from pathlib import Path
 import app
 from app import VersionedVault
@@ -215,5 +215,201 @@ class DuplicateMemberTest(_VaultCase):
         self.write_log(prefix.decode())
         self.assertEqual(self.vault.put("a",3),2)
         self.assertEqual(VersionedVault(self.root).get("a"),3)
+
+class SnapshotTest(_VaultCase):
+    def _seed(self):
+        # 1 a=1, 2 b=2, 3 a=3, 4 b=4, 5 c=5
+        self.assertEqual(self.vault.put("a",1),1)
+        self.assertEqual(self.vault.put("b",2),2)
+        self.assertEqual(self.vault.put("a",3),3)
+        self.assertEqual(self.vault.put("b",4),4)
+        self.assertEqual(self.vault.put("c",5),5)
+    def test_version_zero_is_empty(self):
+        self._seed()
+        self.assertEqual(self.vault.snapshot_at(0),[])
+    def test_empty_vault_bounds(self):
+        self.assertEqual(self.vault.snapshot_at(0),[])
+        self.assertEqual(self.vault.snapshot_at(),[])
+        self.assertEqual(self.vault.snapshot_at(None),[])
+    def test_points_in_time_keep_last_record_per_name(self):
+        self._seed()
+        self.assertEqual(self.vault.snapshot_at(1),
+                         [{"name":"a","version":1,"value":1}])
+        self.assertEqual(self.vault.snapshot_at(2),
+                         [{"name":"a","version":1,"value":1},
+                          {"name":"b","version":2,"value":2}])
+        # record 3 overwrites a, which sorts first but keeps version 3
+        self.assertEqual(self.vault.snapshot_at(3),
+                         [{"name":"a","version":3,"value":3},
+                          {"name":"b","version":2,"value":2}])
+        self.assertEqual(self.vault.snapshot_at(4),
+                         [{"name":"a","version":3,"value":3},
+                          {"name":"b","version":4,"value":4}])
+        self.assertEqual(self.vault.snapshot_at(5),
+                         [{"name":"a","version":3,"value":3},
+                          {"name":"b","version":4,"value":4},
+                          {"name":"c","version":5,"value":5}])
+        # names not yet present at the point in time are absent entirely
+        self.assertEqual([e["name"] for e in self.vault.snapshot_at(1)],["a"])
+        self.assertEqual([e["name"] for e in self.vault.snapshot_at(2)],["a","b"])
+    def test_latest_matches_versions(self):
+        self._seed()
+        # versions() is the public entry structure for the current state
+        self.assertEqual(self.vault.snapshot_at(),self.vault.versions())
+        self.assertEqual(self.vault.snapshot_at(None),self.vault.versions())
+        self.assertEqual(self.vault.snapshot_at(5),self.vault.versions())
+    def test_names_stably_sorted(self):
+        self.vault.put("zeta",1); self.vault.put("alpha",2); self.vault.put("mid",3)
+        self.assertEqual([e["name"] for e in self.vault.snapshot_at()],
+                         ["alpha","mid","zeta"])
+        self.assertEqual([e["name"] for e in self.vault.snapshot_at(2)],
+                         ["alpha","zeta"])
+    def test_returns_deep_copies(self):
+        self.vault.put("k",{"nested":[1,2]})
+        first=self.vault.snapshot_at(1); first[0]["value"]["nested"].append(3)
+        self.assertEqual(self.vault.snapshot_at(1)[0]["value"],{"nested":[1,2]})
+        current=self.vault.snapshot_at(); current[0]["value"]["nested"].append(3)
+        self.assertEqual(self.vault.get("k"),{"nested":[1,2]})
+        # repeated calls are independent of each other too
+        self.assertEqual(self.vault.snapshot_at()[0]["value"],{"nested":[1,2]})
+    def test_read_does_not_append_or_move_active_version(self):
+        self.vault.put("a",1); self.vault.put("b",2)
+        before=self.log_bytes()
+        self.vault.snapshot_at(0); self.vault.snapshot_at(1)
+        self.vault.snapshot_at(); self.vault.snapshot_at(None)
+        self.assertEqual(self.log_bytes(),before)
+        self.assertEqual(self.vault.active_version("a"),1)
+        self.assertEqual(self.vault.active_version("b"),2)
+    def test_invalid_versions_raise_value_error(self):
+        self._seed()
+        for bad in (-1,-2,6,100):
+            with self.assertRaises(ValueError): self.vault.snapshot_at(bad)
+        for bad in ("1","x",1.0,1.5,True,False,[1],object()):
+            with self.assertRaises(ValueError): self.vault.snapshot_at(bad)
+        # bool must not sneak in as int 1 or 0
+        with self.assertRaises(ValueError): self.vault.snapshot_at(True)
+        with self.assertRaises(ValueError): self.vault.snapshot_at(False)
+    def test_reflects_only_last_successful_load_until_explicit_reload(self):
+        self._seed()
+        good=self.log_bytes()
+        self.write_log(good.decode()+"not-json\n")
+        # corrupt log on disk changes nothing about in-memory reads
+        self.assertEqual(self.vault.snapshot_at(),
+                         [{"name":"a","version":3,"value":3},
+                          {"name":"b","version":4,"value":4},
+                          {"name":"c","version":5,"value":5}])
+        self.assertEqual(self.vault.snapshot_at(3),
+                         [{"name":"a","version":3,"value":3},
+                          {"name":"b","version":2,"value":2}])
+        with self.assertRaises(ValueError): self.vault.reload()
+        # failed reload also leaves the loaded state intact
+        self.assertEqual(len(self.vault.snapshot_at()),3)
+        self.write_log(good.decode())
+        self.assertEqual(self.vault.reload(),3)
+        self.assertEqual(len(self.vault.snapshot_at()),3)
+    def test_concurrent_reload_never_mixes_states(self):
+        # The reloader toggles the on-disk log between a 5-record chain and a
+        # 7-record chain (extra writes for an existing and a new name) and
+        # reloads after each swap, while readers take snapshots continuously.
+        # Every observed snapshot must be exactly one of the two complete
+        # states: never partial and never mixing names/records from both.
+        self._seed()
+        log=self.root/"versions.jsonl"
+        base=log.read_bytes()
+        def line_for(version,name,value):
+            rec={"version":version,"name":name,"value":value}
+            rec["digest"]=VersionedVault._digest(rec)
+            return (json.dumps(rec,sort_keys=True)+"\n").encode()
+        tail6=line_for(6,"a",60)+line_for(7,"d",70)
+        short={("a",3),("b",4),("c",5)}
+        long_={("a",6),("b",4),("c",5),("d",7)}
+        stop=threading.Event(); errors=[]; seen=set()
+        def reader():
+            while not stop.is_set():
+                try:
+                    snap=self.vault.snapshot_at()
+                except Exception as exc:  # pragma: no cover - diagnostic
+                    errors.append(exc); return
+                pairs=tuple(sorted((e["name"],e["version"]) for e in snap))
+                seen.add(pairs)
+        def toggler():
+            extended=False
+            while not stop.is_set():
+                log.write_bytes(base+tail6 if extended else base)
+                extended=not extended
+                self.vault.reload()
+        threads=[threading.Thread(target=reader) for _ in range(4)]
+        threads.append(threading.Thread(target=toggler))
+        for t in threads: t.start()
+        timer=threading.Timer(1.5,stop.set()); timer.start()
+        for t in threads: t.join()
+        timer.cancel()
+        self.assertEqual(errors,[])
+        self.assertTrue(seen)
+        for pairs in seen:
+            self.assertIn(set(pairs),(short,long_),pairs)
+
+class SnapshotCliTest(_VaultCase):
+    def _seed(self):
+        self.vault.put("a",1); self.vault.put("b",2); self.vault.put("a",3)
+    def _run(self,*args):
+        env=dict(os.environ,PYTHONPATH=str(Path(app.__file__).parent))
+        return subprocess.run(
+            [sys.executable,str(Path(app.__file__)),*args],
+            capture_output=True,text=True,env=env)
+    def test_default_and_versioned_json_output(self):
+        self._seed()
+        r=self._run("snapshot","--root",str(self.root))
+        self.assertEqual(r.returncode,0,r.stderr)
+        data=json.loads(r.stdout)
+        self.assertEqual(data,
+                         [{"name":"a","version":3,"value":3},
+                          {"name":"b","version":2,"value":2}])
+        r=self._run("snapshot","--root",str(self.root),"--version","1")
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertEqual(json.loads(r.stdout),
+                         [{"name":"a","version":1,"value":1}])
+        r=self._run("snapshot","--root",str(self.root),"--version","0")
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertEqual(json.loads(r.stdout),[])
+    def test_output_sorting_is_deterministic(self):
+        self._seed()
+        r1=self._run("snapshot","--root",str(self.root))
+        r2=self._run("snapshot","--root",str(self.root))
+        self.assertEqual(r1.stdout,r2.stdout)
+        # keys sorted, unicode unescaped
+        self.vault.put("名","值")
+        r=self._run("snapshot","--root",str(self.root))
+        self.assertIn('"名"',r.stdout)
+    def test_invalid_version_exits_1_with_no_output(self):
+        self._seed()
+        for arg in ("-1","4","99","abc","1.5"):
+            r=self._run("snapshot","--root",str(self.root),"--version",arg)
+            self.assertEqual(r.returncode,1,(arg,r.stdout,r.stderr))
+            self.assertEqual(r.stdout,"",arg)
+    def test_no_version_reads_last_loaded_state_only(self):
+        self._seed()
+        good=self.log_bytes()
+        self.write_log(good.decode()+"broken\n")
+        # CLI constructs a fresh vault, so a corrupt log fails construction
+        # the same ValueError path; first confirm an untouched root reads fine,
+        # then restore and confirm newest loaded state.
+        self.write_log(good.decode())
+        r=self._run("snapshot","--root",str(self.root))
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertEqual(json.loads(r.stdout),
+                         [{"name":"a","version":3,"value":3},
+                          {"name":"b","version":2,"value":2}])
+    def test_existing_get_version_behavior_unchanged(self):
+        self._seed()
+        r=self._run("get","--root",str(self.root),"--name","a","--version","1","--json")
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertEqual(json.loads(r.stdout),1)
+        # malformed --version for get keeps argparse's exit status 2
+        r=self._run("get","--root",str(self.root),"--name","a","--version","x")
+        self.assertEqual(r.returncode,2)
+        r=self._run("get","--root",str(self.root),"--name","a","--version","-1")
+        # negative parses as int then fails get's positive-integer rule -> 1
+        self.assertEqual(r.returncode,1)
 
 if __name__=='__main__': unittest.main()

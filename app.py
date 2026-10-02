@@ -236,9 +236,34 @@ class VersionedVault:
     def versions(self):
         return [{"name":k,"version":v["version"],"value":copy.deepcopy(v["value"])}
                 for k,v in sorted(self._state.snapshot.items())]
+    def snapshot_at(self,version=None):
+        # Whole-vault view at a global record count: version 0 is the empty
+        # vault, version N keeps only the last record of each name among the
+        # first N loaded records, and omitting it (or passing the latest loaded
+        # count) reproduces the current loaded state.  The state is captured
+        # once into a local, so a call concurrent with reload/put sees one
+        # complete state or the other, never a mix of names or records.  This
+        # reads memory only: it never opens the log, appends, or changes the
+        # active version, and a log corrupted after the last successful reload
+        # is invisible here until the next explicit reload.
+        state=self._state
+        total=len(state.records)
+        if version is None:
+            version=total
+        if not isinstance(version,int) or isinstance(version,bool) or version<0:
+            raise ValueError("version must be a non-negative integer")
+        if version>total:
+            raise ValueError("version is beyond the loaded record count")
+        latest={}
+        for i in range(version):
+            record=state.records[i]
+            latest[record["name"]]=record
+        return [{"name":name,"version":latest[name]["version"],
+                 "value":copy.deepcopy(latest[name]["value"])}
+                for name in sorted(latest)]
 if __name__=="__main__":
     p=argparse.ArgumentParser(description="VersionedVault command line")
-    p.add_argument("command",choices=("put","get","versions","active","history"))
+    p.add_argument("command",choices=("put","get","versions","active","history","snapshot"))
     p.add_argument("--root",default="vault")
     p.add_argument("--name")
     p.add_argument("--value",help="write the argument verbatim as a string; mutually exclusive with --value-json")
@@ -247,7 +272,11 @@ if __name__=="__main__":
                         "value (objects, arrays, numbers, booleans and null keep their type); "
                         "mutually exclusive with --value: giving both, or passing text that is "
                         "not a complete JSON document, exits with status 1 without appending a record")
-    p.add_argument("--version",type=int)
+    # Parsed as text on purpose: get keeps argparse's historic exit status 2
+    # for a malformed --version, while snapshot funnels every bad version
+    # (wrong type, negative, out of range) through the library's ValueError and
+    # the shared status-1 path, printing nothing.
+    p.add_argument("--version")
     p.add_argument("--if-version",dest="if_version",
                    help="only for put: append only when the named config's active "
                         "version equals N; a missing name or a stale N exits with "
@@ -287,13 +316,36 @@ if __name__=="__main__":
             else:
                 print(v.put(a.name,value))
         elif a.command=="get":
-            value=v.get(a.name) if a.version is None else v.get(a.name,a.version)
+            # Parse --version the same way argparse's int type used to: any
+            # non-integer text fails before the vault call and keeps its
+            # historic exit status (SystemExit with code 2).
+            if a.version is None:
+                value=v.get(a.name)
+            else:
+                try:
+                    get_version=int(a.version,10)
+                except ValueError:
+                    raise SystemExit(2)
+                value=v.get(a.name,get_version)
             if a.json_output:
                 print(json.dumps(value,ensure_ascii=False,sort_keys=True))
             else:
                 print(value)
         elif a.command=="versions":
             print(json.dumps(v.versions(),ensure_ascii=False,sort_keys=True))
+        elif a.command=="snapshot":
+            # No --version: only the state from the most recent successful
+            # load.  Every invalid version is a library ValueError -> exit 1
+            # with no partial output; 0 is a valid empty snapshot.
+            if a.version is None:
+                snapshot=v.snapshot_at()
+            else:
+                try:
+                    at=int(a.version,10)
+                except ValueError:
+                    raise SystemExit(1)
+                snapshot=v.snapshot_at(at)
+            print(json.dumps(snapshot,ensure_ascii=False,sort_keys=True))
         elif a.command=="active":
             print(v.active_version(a.name))
         else:
