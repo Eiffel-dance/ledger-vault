@@ -279,4 +279,76 @@ class PutBatchTest(_VaultCase):
         self.write_log(good.decode())
         self.assertEqual(self.vault.put_batch([["b",2],["c",3]]),[2,3])
 
+class DiffAtTest(_VaultCase):
+    def populate(self):
+        self.vault.put("a",1)                 # 1
+        self.vault.put("b",{"x":[1,2]})       # 2
+        self.vault.put("a",2)                 # 3
+        self.vault.put_batch([["c","see"],["b",{"x":[1,2]}]])  # 4,5
+    def test_empty_vault_and_equal_points(self):
+        self.assertEqual(self.vault.diff_at(0,0),[])
+        self.populate()
+        for point in (0,1,3,5):
+            self.assertEqual(self.vault.diff_at(point,point),[])
+    def test_added_changed_and_removed_names(self):
+        self.populate()
+        # 0 -> 2: everything added, from side is None
+        self.assertEqual(self.vault.diff_at(0,2),[
+            {"name":"a","from":None,"to":{"version":1,"value":1}},
+            {"name":"b","from":None,"to":{"version":2,"value":{"x":[1,2]}}},
+        ])
+        # 2 -> 3: only "a" changed
+        self.assertEqual(self.vault.diff_at(2,3),[
+            {"name":"a","from":{"version":1,"value":1},"to":{"version":3,"value":2}},
+        ])
+        # 3 -> 5: "b" rewritten with an equal value under a new version still
+        # counts as a change; "c" is added
+        self.assertEqual(self.vault.diff_at(3,5),[
+            {"name":"b","from":{"version":2,"value":{"x":[1,2]}},
+                        "to":{"version":5,"value":{"x":[1,2]}}},
+            {"name":"c","from":None,"to":{"version":4,"value":"see"}},
+        ])
+        # 5 -> 3 is rejected, but 5 -> 2 shows "a" reverting and "c" removed
+        self.assertEqual(self.vault.diff_at(2,5),[
+            {"name":"a","from":{"version":1,"value":1},"to":{"version":3,"value":2}},
+            {"name":"b","from":{"version":2,"value":{"x":[1,2]}},
+                        "to":{"version":5,"value":{"x":[1,2]}}},
+            {"name":"c","from":None,"to":{"version":4,"value":"see"}},
+        ])
+    def test_names_sorted_in_unicode_order(self):
+        self.vault.put("z",1); self.vault.put("ä",2); self.vault.put("A",3)
+        self.assertEqual([e["name"] for e in self.vault.diff_at(0,3)],["A","z","ä"])
+    def test_result_is_deep_copied(self):
+        self.vault.put("k",{"nested":[1,2]})
+        entry=self.vault.diff_at(0,1)[0]
+        entry["to"]["value"]["nested"].append(3)
+        self.assertEqual(self.vault.get("k"),{"nested":[1,2]})
+        again=self.vault.diff_at(0,1)
+        self.assertEqual(again[0]["to"]["value"],{"nested":[1,2]})
+        again[0]["to"]["value"]["nested"].append(9)
+        self.assertEqual(self.vault.diff_at(0,1)[0]["to"]["value"],{"nested":[1,2]})
+    def test_invalid_points_raise_value_error_without_side_effects(self):
+        self.populate()
+        before=self.vault.versions(); before_bytes=self.log_bytes()
+        for args in ((-1,2),(0,-1),(True,2),(0,False),(1.0,2),(0,"2"),
+                     (None,2),(2,None),(3,1),(0,6),(5,6),(4,3)):
+            with self.assertRaises(ValueError,msg=repr(args)):
+                self.vault.diff_at(*args)
+        self.assertEqual(self.vault.versions(),before)
+        self.assertEqual(self.log_bytes(),before_bytes)
+        self.assertEqual(self.vault.put("d",4),6)
+    def test_uses_state_captured_at_call_start(self):
+        self.populate()
+        # corrupting the log afterwards cannot change a diff computed from
+        # the already loaded state, and diff_at never touches disk
+        before_bytes=self.log_bytes()
+        self.write_log(before_bytes.decode()+"not-json\n")
+        result=self.vault.diff_at(0,5)
+        self.assertEqual([e["name"] for e in result],["a","b","c"])
+        self.assertEqual(self.log_bytes(),before_bytes+b"not-json\n")
+        with self.assertRaisesRegex(ValueError,r"^invalid vault record$"):
+            self.vault.reload()
+        # the retained snapshot still answers diffs against the old state
+        self.assertEqual(self.vault.diff_at(0,5),result)
+
 if __name__=='__main__': unittest.main()

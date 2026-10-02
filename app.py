@@ -333,9 +333,54 @@ class VersionedVault:
             snapshot[r["name"]]={"version":r["version"],"value":r["value"]}
         return [{"name":k,"version":v["version"],"value":copy.deepcopy(v["value"])}
                 for k,v in sorted(snapshot.items())]
+    def diff_at(self,from_version,to_version):
+        # Deterministic difference between two whole-repository points in
+        # time, each located by global record sequence number (0 = empty
+        # snapshot).  Both arguments must be non-negative integers (bools
+        # rejected), from_version must not exceed to_version, and to_version
+        # must not exceed the number of loaded records; any violation is a
+        # ValueError raised before anything else happens, so memory, disk and
+        # the next version number are all untouched.  The published _State is
+        # captured once at call start and never mutated after publication, so
+        # a concurrent reload can only expose the complete old or new state,
+        # never a mix, and a log corrupted afterwards cannot change this
+        # result.  Nothing here touches disk.  A name appears only when its
+        # record differs between the two points: because versions are global
+        # sequence numbers, an equal value rewritten under a new version still
+        # counts as a change, while an identical version number means the very
+        # same record (and value) on both sides.  Entries are sorted by name
+        # in Unicode codepoint order and every returned value is a fresh deep
+        # copy; equal points (including 0 and 0 on an empty vault) yield [].
+        state=self._state
+        for point in (from_version,to_version):
+            if not isinstance(point,int) or isinstance(point,bool) or point<0:
+                raise ValueError("version must be a non-negative integer")
+        if from_version>to_version:
+            raise ValueError("from_version must not exceed to_version")
+        if to_version>len(state.records):
+            raise ValueError("to_version must not exceed the number of loaded records")
+        def snapshot_at(point):
+            snapshot={}
+            for r in state.records[:point]:
+                snapshot[r["name"]]={"version":r["version"],"value":r["value"]}
+            return snapshot
+        before=snapshot_at(from_version); after=snapshot_at(to_version)
+        diff=[]
+        for name in sorted(set(before)|set(after)):
+            old=before.get(name); new=after.get(name)
+            if old is not None and new is not None and old["version"]==new["version"]:
+                continue
+            diff.append({
+                "name":name,
+                "from":None if old is None else
+                    {"version":old["version"],"value":copy.deepcopy(old["value"])},
+                "to":None if new is None else
+                    {"version":new["version"],"value":copy.deepcopy(new["value"])},
+            })
+        return diff
 if __name__=="__main__":
     p=argparse.ArgumentParser(description="VersionedVault command line")
-    p.add_argument("command",choices=("put","get","versions","active","history","snapshot"))
+    p.add_argument("command",choices=("put","get","versions","active","history","snapshot","diff"))
     p.add_argument("--root",default="vault")
     p.add_argument("--name")
     p.add_argument("--value",help="write the argument verbatim as a string; mutually exclusive with --value-json")
@@ -351,6 +396,12 @@ if __name__=="__main__":
                    help="only for put: append only when the named config's active "
                         "version equals N; a missing name or a stale N exits with "
                         "status 1 without writing or printing a version")
+    p.add_argument("--from-version",dest="from_version",
+                   help="only for diff: start point as a global record sequence number "
+                        "(0 = empty snapshot); required together with --to-version")
+    p.add_argument("--to-version",dest="to_version",
+                   help="only for diff: end point as a global record sequence number; "
+                        "required together with --from-version and must not be smaller")
     p.add_argument("--json",dest="json_output",action="store_true",
                    help="only affects get: print the value as a single JSON document on stdout "
                         "(sorted object keys, unescaped Unicode), accepted by json.loads; "
@@ -420,6 +471,24 @@ if __name__=="__main__":
             # An out-of-range point raises ValueError from snapshot_at and is
             # handled below, again with no partial output.
             print(json.dumps(v.snapshot_at(point),ensure_ascii=False,sort_keys=True))
+        elif a.command=="diff":
+            # Both points are required and parsed by hand, like snapshot's
+            # --version: a missing option, malformed text, fractions and
+            # negative numbers all take the unified failure path (status 1,
+            # nothing printed) instead of argparse's 2, and nothing is
+            # written to the log.
+            if a.from_version is None or a.to_version is None:
+                raise SystemExit(1)
+            try:
+                from_point=int(a.from_version,10)
+                to_point=int(a.to_version,10)
+            except ValueError:
+                raise SystemExit(1)
+            if from_point<0 or to_point<0 or from_point>to_point:
+                raise SystemExit(1)
+            # An out-of-range point raises ValueError from diff_at and is
+            # handled below, again with no partial output.
+            print(json.dumps(v.diff_at(from_point,to_point),ensure_ascii=False,sort_keys=True))
         else:
             print(json.dumps(v.history(a.name),ensure_ascii=False,sort_keys=True))
     except (KeyError,ValueError,TypeError,VersionConflictError):
