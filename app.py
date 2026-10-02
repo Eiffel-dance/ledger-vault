@@ -1,5 +1,17 @@
-import argparse, copy, hashlib, json, math
+import argparse, copy, hashlib, json, math, threading
 from pathlib import Path
+
+class VersionConflictError(Exception):
+    # Raised by put_if_version when the active version on disk does not match
+    # the caller's expected version.  actual_version is None when the name has
+    # no record at all.  No record is appended and no snapshot is replaced.
+    def __init__(self,name,expected_version,actual_version):
+        super().__init__(
+            "version conflict for %r: expected active version %r, found %r"
+            %(name,expected_version,actual_version))
+        self.name=name
+        self.expected_version=expected_version
+        self.actual_version=actual_version
 
 class _State:
     __slots__=("snapshot","records","by_version")
@@ -7,6 +19,10 @@ class _State:
         self.snapshot=snapshot; self.records=records; self.by_version=by_version
 
 class VersionedVault:
+    # One process-wide lock serializes the check-and-append critical section of
+    # put/put_if_version across every instance, so concurrent writers revalidate
+    # the chain each time and version numbers stay continuous.
+    _write_lock=threading.Lock()
     def __init__(self, root="vault"):
         self.root=Path(root); self.log=self.root/"versions.jsonl"
         self._state=_State({},(),{})
@@ -130,6 +146,23 @@ class VersionedVault:
         # (coerced or duplicated keys, NaN/Infinity, tuple arrays) must fail as
         # TypeError without creating a directory, writing bytes, or touching state.
         self._ensure_storable(value)
+        with self._write_lock:
+            return self._append(name,value)
+    def put_if_version(self,name,expected_version,value):
+        # Conditional put: append only when the name's active version on disk
+        # equals expected_version, so a caller writing back a previously read
+        # configuration cannot silently overwrite a newer one.
+        if not isinstance(name,str) or not name:
+            raise ValueError("name required")
+        if not self._is_positive_int(expected_version):
+            raise ValueError("expected_version must be a positive integer")
+        # Same round-trip rules as put; every validation failure above and the
+        # conflict check below happen before any directory, byte, or state change.
+        self._ensure_storable(value)
+        with self._write_lock:
+            return self._append(name,value,expected_version=expected_version)
+    def _append(self,name,value,expected_version=None):
+        # Caller must hold _write_lock; name and value must already be validated.
         # Revalidate the complete chain from disk so a new record is only
         # appended when it can attach to the existing valid chain.
         state=self._load()
@@ -146,6 +179,15 @@ class VersionedVault:
         original={"version":version,"name":name,"value":value}
         if not self._json_equal(parsed,original):
             raise TypeError("value is not storable under the vault JSON rules")
+        if expected_version is not None:
+            # The active version comes from the freshly revalidated on-disk
+            # chain, never from the cached snapshot; under the write lock this
+            # check-and-append is atomic, so of two concurrent callers with the
+            # same expectation exactly one observes the match.
+            entry=state.snapshot.get(name)
+            actual=entry["version"] if entry is not None else None
+            if actual!=expected_version:
+                raise VersionConflictError(name,expected_version,actual)
         self.root.mkdir(parents=True,exist_ok=True)
         with self.log.open("a",encoding="utf-8") as f: f.write(line)
         self.reload(); return version
@@ -181,6 +223,11 @@ if __name__=="__main__":
                         "mutually exclusive with --value: giving both, or passing text that is "
                         "not a complete JSON document, exits with status 1 without appending a record")
     p.add_argument("--version",type=int)
+    p.add_argument("--if-version",dest="if_version",
+                   help="only affects put: append the record only when the name's active "
+                        "version on disk equals N; a missing name, a different active "
+                        "version, or an N that is not a positive integer exits with "
+                        "status 1 without appending a record or printing a version")
     p.add_argument("--json",dest="json_output",action="store_true",
                    help="only affects get: print the value as a single JSON document on stdout "
                         "(sorted object keys, unescaped Unicode), accepted by json.loads; "
@@ -202,7 +249,16 @@ if __name__=="__main__":
                     raise SystemExit(1)
             else:
                 value=a.value
-            print(v.put(a.name,value))
+            if a.if_version is not None:
+                # Parsed by hand (not argparse type=int) so a non-integer N
+                # reports the same unified status 1 as every other failure.
+                try:
+                    expected=int(a.if_version)
+                except (ValueError,TypeError):
+                    raise SystemExit(1)
+                print(v.put_if_version(a.name,expected,value))
+            else:
+                print(v.put(a.name,value))
         elif a.command=="get":
             value=v.get(a.name) if a.version is None else v.get(a.name,a.version)
             if a.json_output:
@@ -215,5 +271,5 @@ if __name__=="__main__":
             print(v.active_version(a.name))
         else:
             print(json.dumps(v.history(a.name),ensure_ascii=False,sort_keys=True))
-    except (KeyError,ValueError,TypeError):
+    except (KeyError,ValueError,TypeError,VersionConflictError):
         raise SystemExit(1)
