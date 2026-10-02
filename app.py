@@ -155,12 +155,50 @@ class VersionedVault:
         return [{"name":k,"version":v["version"],"value":copy.deepcopy(v["value"])}
                 for k,v in sorted(self._state.snapshot.items())]
 if __name__=="__main__":
-    p=argparse.ArgumentParser(); p.add_argument("command",choices=("put","get","versions","active","history")); p.add_argument("--root",default="vault"); p.add_argument("--name"); p.add_argument("--value"); p.add_argument("--version",type=int); a=p.parse_args(); v=VersionedVault(a.root)
+    p=argparse.ArgumentParser(description="VersionedVault command line")
+    p.add_argument("command",choices=("put","get","versions","active","history"))
+    p.add_argument("--root",default="vault")
+    p.add_argument("--name")
+    p.add_argument("--value",help="write the argument verbatim as a string; mutually exclusive with --value-json")
+    p.add_argument("--value-json",dest="value_json",
+                   help="parse the argument as one complete JSON document and write the parsed "
+                        "value (objects, arrays, numbers, booleans and null keep their type); "
+                        "mutually exclusive with --value: giving both, or passing text that is "
+                        "not a complete JSON document, exits with status 1 without appending a record")
+    p.add_argument("--version",type=int)
+    p.add_argument("--json",dest="json_output",action="store_true",
+                   help="only affects get: print the value as a single JSON document on stdout "
+                        "(sorted object keys, unescaped Unicode), accepted by json.loads; "
+                        "without this flag get keeps its default output")
+    a=p.parse_args()
     try:
-        if a.command=="put": print(v.put(a.name,a.value))
-        elif a.command=="get": print(v.get(a.name) if a.version is None else v.get(a.name,a.version))
-        elif a.command=="versions": print(json.dumps(v.versions(),ensure_ascii=False,sort_keys=True))
-        elif a.command=="active": print(v.active_version(a.name))
-        else: print(json.dumps(v.history(a.name),ensure_ascii=False,sort_keys=True))
+        v=VersionedVault(a.root)
+        if a.command=="put":
+            # Checked by hand instead of an argparse mutually-exclusive group so
+            # the conflict reports the same unified status 1 as every other
+            # failure, and is rejected before parsing or writing anything.
+            if a.value is not None and a.value_json is not None:
+                raise SystemExit(1)
+            if a.value_json is not None:
+                try:
+                    value=json.loads(a.value_json)
+                except (ValueError,TypeError):
+                    # Not a complete JSON document: no record, no version output.
+                    raise SystemExit(1)
+            else:
+                value=a.value
+            print(v.put(a.name,value))
+        elif a.command=="get":
+            value=v.get(a.name) if a.version is None else v.get(a.name,a.version)
+            if a.json_output:
+                print(json.dumps(value,ensure_ascii=False,sort_keys=True))
+            else:
+                print(value)
+        elif a.command=="versions":
+            print(json.dumps(v.versions(),ensure_ascii=False,sort_keys=True))
+        elif a.command=="active":
+            print(v.active_version(a.name))
+        else:
+            print(json.dumps(v.history(a.name),ensure_ascii=False,sort_keys=True))
     except (KeyError,ValueError,TypeError):
         raise SystemExit(1)
