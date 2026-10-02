@@ -1,4 +1,4 @@
-import argparse, copy, hashlib, json
+import argparse, copy, hashlib, json, math
 from pathlib import Path
 
 class _State:
@@ -18,6 +18,56 @@ class VersionedVault:
     @staticmethod
     def _is_positive_int(value):
         return isinstance(value,int) and not isinstance(value,bool) and value>0
+    @staticmethod
+    def _ensure_storable(value):
+        # A value is only accepted if it can round-trip through the on-disk
+        # JSONL record and digest rules with unchanged JSON semantics.  This is
+        # pure and side-effect free so callers can run it before creating any
+        # directory or opening the log; every failure is a TypeError.
+        try:
+            json.dumps(value)
+        except (TypeError, ValueError):
+            # Circular references surface as ValueError from json; unify them
+            # with every other encoding failure as TypeError.
+            raise TypeError("value is not JSON serializable")
+        stack=[value]
+        while stack:
+            node=stack.pop()
+            if isinstance(node,dict):
+                tokens=set()
+                for key,item in node.items():
+                    # json.dumps silently coerces non-string keys (1 -> "1",
+                    # None -> "null", (1,) -> "[1]"), and distinct float NaN
+                    # keys even collapse onto one duplicated "NaN" key.  The
+                    # reloaded object would differ, so reject up front.
+                    if not isinstance(key,str):
+                        raise TypeError("object keys must be strings")
+                    token=json.dumps(key)
+                    if token in tokens:
+                        raise TypeError("duplicate object key after JSON encoding")
+                    tokens.add(token)
+                    stack.append(item)
+            elif isinstance(node,(list,tuple)):
+                # Tuples share JSON array semantics with lists and reload as
+                # lists; descend either way so nested keys are checked too.
+                stack.extend(node)
+    @staticmethod
+    def _json_equal(left,right):
+        # Structural equality under this vault's JSON semantics: identical
+        # container types and scalar values, treating NaN as equal to NaN so
+        # an accepted non-finite float still verifies after a reload.  A tuple
+        # never equals the list it would reload as, so such a value is rejected.
+        if type(left) is not type(right):
+            return False
+        if isinstance(left,float) and math.isnan(left) and math.isnan(right):
+            return True
+        if isinstance(left,dict):
+            return left.keys()==right.keys() and all(
+                VersionedVault._json_equal(left[k],right[k]) for k in left)
+        if isinstance(left,list):
+            return len(left)==len(right) and all(
+                VersionedVault._json_equal(x,y) for x,y in zip(left,right))
+        return left==right
     def _parse_record(self,line,previous):
         try:
             item=json.loads(line)
@@ -60,20 +110,27 @@ class VersionedVault:
     def put(self,name,value):
         if not isinstance(name,str) or not name:
             raise ValueError("name required")
-        # Encode before opening the log: an unencodable value raises TypeError
-        # without creating a directory, writing bytes, or touching state.
-        try:
-            json.dumps(value)
-        except (TypeError, ValueError):
-            # Circular references surface as ValueError from json; unify them
-            # with every other encoding failure as TypeError.
-            raise TypeError("value is not JSON serializable")
+        # Validate round-trip semantics before touching the filesystem: a value
+        # that json.dumps accepts but which reloads as a different object
+        # (coerced or duplicated keys, NaN/Infinity, tuple arrays) must fail as
+        # TypeError without creating a directory, writing bytes, or touching state.
+        self._ensure_storable(value)
         # Revalidate the complete chain from disk so a new record is only
         # appended when it can attach to the existing valid chain.
         state=self._load()
         version=len(state.records)+1
         item={"version":version,"name":name,"value":value}; item["digest"]=self._digest(item)
         line=json.dumps(item,sort_keys=True)+"\n"
+        # Rehearse the append: the exact bytes about to be written must parse
+        # as the next record in the chain, reproduce the digest, and reload to
+        # a value equal to the submitted one.  Only then open the log.
+        try:
+            parsed=self._parse_record(line[:-1],version-1)
+        except ValueError:
+            raise TypeError("value is not storable under the vault JSON rules")
+        original={"version":version,"name":name,"value":value}
+        if not self._json_equal(parsed,original):
+            raise TypeError("value is not storable under the vault JSON rules")
         self.root.mkdir(parents=True,exist_ok=True)
         with self.log.open("a",encoding="utf-8") as f: f.write(line)
         self.reload(); return version
