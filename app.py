@@ -52,11 +52,22 @@ class VersionedVault:
         self._state=_State(snapshot,tuple(records),by_version)
         return len(snapshot)
     def put(self,name,value):
-        if not name: raise ValueError("name required")
-        version=sum(1 for _ in self.log.open(encoding="utf-8"))+1 if self.log.exists() else 1
+        if not isinstance(name,str) or not name:
+            raise ValueError("name required")
+        json.dumps(value)
+        last=0
+        if self.log.exists():
+            try:
+                text=self.log.read_text(encoding="utf-8")
+            except ValueError:
+                raise ValueError("invalid vault record")
+            for line in text.splitlines():
+                last=self._parse_record(line,last)["version"]
+        version=last+1
         item={"version":version,"name":name,"value":value}; item["digest"]=self._digest(item)
+        encoded=json.dumps(item,sort_keys=True)
         self.root.mkdir(parents=True,exist_ok=True)
-        with self.log.open("a",encoding="utf-8") as f: f.write(json.dumps(item,sort_keys=True)+"\n")
+        with self.log.open("a",encoding="utf-8") as f: f.write(encoded+"\n")
         self.reload(); return version
     def get(self,name,version=None):
         state=self._state
