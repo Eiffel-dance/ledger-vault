@@ -35,7 +35,7 @@ class VersionedVault:
         if not isinstance(digest,str) or digest!=self._digest(item):
             raise ValueError("invalid vault record")
         return {"version":version,"name":name,"value":item["value"]}
-    def reload(self):
+    def _load(self):
         snapshot,records,by_version={},[],{}
         previous=0
         if self.log.exists():
@@ -49,14 +49,33 @@ class VersionedVault:
                 records.append(item)
                 by_version[item["version"]]=item
                 snapshot[item["name"]]={"version":item["version"],"value":item["value"]}
-        self._state=_State(snapshot,tuple(records),by_version)
-        return len(snapshot)
+        return _State(snapshot,tuple(records),by_version)
+    def reload(self):
+        # Build the complete new state first; only replace the snapshot once
+        # the whole chain has validated, so readers never see an intermediate
+        # state and a corrupt log leaves the previous snapshot untouched.
+        state=self._load()
+        self._state=state
+        return len(state.snapshot)
     def put(self,name,value):
-        if not name: raise ValueError("name required")
-        version=sum(1 for _ in self.log.open(encoding="utf-8"))+1 if self.log.exists() else 1
+        if not isinstance(name,str) or not name:
+            raise ValueError("name required")
+        # Encode before opening the log: an unencodable value raises TypeError
+        # without creating a directory, writing bytes, or touching state.
+        try:
+            json.dumps(value)
+        except (TypeError, ValueError):
+            # Circular references surface as ValueError from json; unify them
+            # with every other encoding failure as TypeError.
+            raise TypeError("value is not JSON serializable")
+        # Revalidate the complete chain from disk so a new record is only
+        # appended when it can attach to the existing valid chain.
+        state=self._load()
+        version=len(state.records)+1
         item={"version":version,"name":name,"value":value}; item["digest"]=self._digest(item)
+        line=json.dumps(item,sort_keys=True)+"\n"
         self.root.mkdir(parents=True,exist_ok=True)
-        with self.log.open("a",encoding="utf-8") as f: f.write(json.dumps(item,sort_keys=True)+"\n")
+        with self.log.open("a",encoding="utf-8") as f: f.write(line)
         self.reload(); return version
     def get(self,name,version=None):
         state=self._state
@@ -86,5 +105,5 @@ if __name__=="__main__":
         elif a.command=="versions": print(json.dumps(v.versions(),ensure_ascii=False,sort_keys=True))
         elif a.command=="active": print(v.active_version(a.name))
         else: print(json.dumps(v.history(a.name),ensure_ascii=False,sort_keys=True))
-    except (KeyError,ValueError):
+    except (KeyError,ValueError,TypeError):
         raise SystemExit(1)
