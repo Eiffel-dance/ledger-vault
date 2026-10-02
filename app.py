@@ -333,9 +333,55 @@ class VersionedVault:
             snapshot[r["name"]]={"version":r["version"],"value":r["value"]}
         return [{"name":k,"version":v["version"],"value":copy.deepcopy(v["value"])}
                 for k,v in sorted(snapshot.items())]
+    @staticmethod
+    def _is_nonneg_int(value):
+        return isinstance(value,int) and not isinstance(value,bool) and value>=0
+    def diff_at(self,from_version,to_version):
+        # Deterministic difference between two whole-repository points located
+        # by global record ordinal (0 = empty snapshot).  Both bounds must be
+        # non-negative ints (booleans rejected), from must not exceed to, and
+        # neither may exceed the number of loaded records; every violation is a
+        # ValueError raised before any result is built, leaving memory, disk and
+        # the next version number untouched.  The published _State is captured
+        # once here and never mutated after publication, so a concurrent reload
+        # or even external log corruption can only leave this call working from
+        # the complete old state, never a mix, and nothing touches disk.
+        if not self._is_nonneg_int(from_version):
+            raise ValueError("from_version must be a non-negative integer")
+        if not self._is_nonneg_int(to_version):
+            raise ValueError("to_version must be a non-negative integer")
+        if from_version>to_version:
+            raise ValueError("from_version must not exceed to_version")
+        state=self._state
+        total=len(state.records)
+        if to_version>total:
+            raise ValueError("version must not exceed the number of loaded records")
+        def point_snapshot(point):
+            snapshot={}
+            for r in state.records[:point]:
+                snapshot[r["name"]]={"version":r["version"],"value":r["value"]}
+            return snapshot
+        left=point_snapshot(from_version)
+        right=point_snapshot(to_version)
+        # Unicode codepoint (dictionary) order of the config names.  A name is
+        # included only when its active entry differs: a missing side is a real
+        # difference, and rewriting an equal value at a new version is one too.
+        result=[]
+        for name in sorted(set(left)|set(right)):
+            a=left.get(name); b=right.get(name)
+            if (a is not None and b is not None
+                    and a["version"]==b["version"]
+                    and self._json_equal(a["value"],b["value"])):
+                continue
+            result.append({
+                "name":name,
+                "from":None if a is None else {"version":a["version"],"value":copy.deepcopy(a["value"])},
+                "to":None if b is None else {"version":b["version"],"value":copy.deepcopy(b["value"])},
+            })
+        return result
 if __name__=="__main__":
     p=argparse.ArgumentParser(description="VersionedVault command line")
-    p.add_argument("command",choices=("put","get","versions","active","history","snapshot"))
+    p.add_argument("command",choices=("put","get","versions","active","history","snapshot","diff"))
     p.add_argument("--root",default="vault")
     p.add_argument("--name")
     p.add_argument("--value",help="write the argument verbatim as a string; mutually exclusive with --value-json")
@@ -351,6 +397,10 @@ if __name__=="__main__":
                    help="only for put: append only when the named config's active "
                         "version equals N; a missing name or a stale N exits with "
                         "status 1 without writing or printing a version")
+    p.add_argument("--from-version",dest="from_version",
+                   help="only for diff: global record ordinal of the starting point (0 = empty snapshot)")
+    p.add_argument("--to-version",dest="to_version",
+                   help="only for diff: global record ordinal of the ending point (0 = empty snapshot)")
     p.add_argument("--json",dest="json_output",action="store_true",
                    help="only affects get: print the value as a single JSON document on stdout "
                         "(sorted object keys, unescaped Unicode), accepted by json.loads; "
@@ -420,6 +470,24 @@ if __name__=="__main__":
             # An out-of-range point raises ValueError from snapshot_at and is
             # handled below, again with no partial output.
             print(json.dumps(v.snapshot_at(point),ensure_ascii=False,sort_keys=True))
+        elif a.command=="diff":
+            # Both points are required and parsed by hand (like snapshot's
+            # --version): missing options, text that is not a decimal
+            # non-negative integer, fractions and signs all take the unified
+            # failure path (status 1, nothing on stdout) before diff_at runs.
+            if a.from_version is None or a.to_version is None:
+                raise SystemExit(1)
+            def parse_point(text):
+                if not text or not all("0"<=ch<="9" for ch in text):
+                    raise SystemExit(1)
+                return int(text,10)
+            from_point=parse_point(a.from_version)
+            to_point=parse_point(a.to_version)
+            # Ordering and range violations raise ValueError from diff_at and
+            # are handled with every other failure below: status 1, no output,
+            # and the command never appends or creates a record.
+            print(json.dumps(v.diff_at(from_point,to_point),
+                             ensure_ascii=False,sort_keys=True))
         else:
             print(json.dumps(v.history(a.name),ensure_ascii=False,sort_keys=True))
     except (KeyError,ValueError,TypeError,VersionConflictError):
