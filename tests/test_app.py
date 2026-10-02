@@ -216,4 +216,104 @@ class DuplicateMemberTest(_VaultCase):
         self.assertEqual(self.vault.put("a",3),2)
         self.assertEqual(VersionedVault(self.root).get("a"),3)
 
+class BatchTest(_VaultCase):
+    def test_batch_appends_consecutive_versions_in_order(self):
+        self.assertEqual(self.vault.put("pre",0),1)
+        result=self.vault.put_batch([["a",1],["b",[1,2]],["c",{"x":True}]])
+        self.assertEqual(result,[2,3,4])
+        self.assertEqual(self.vault.get("a"),1)
+        self.assertEqual(self.vault.get("b"),[1,2])
+        self.assertEqual(self.vault.get("c"),{"x":True})
+        self.assertEqual([r["version"] for r in self.vault.history()],[1,2,3,4])
+        self.assertEqual(self.vault.put("post",9),5)
+    def test_tuple_container_and_entries_accepted(self):
+        self.assertEqual(self.vault.put_batch((("a",1),("b",2))),[1,2])
+        self.assertEqual(self.vault.get("b"),2)
+    def test_batch_update_keeps_history_and_last_record_wins(self):
+        self.vault.put("a","old")
+        self.assertEqual(self.vault.put_batch([["a","new"],["b",1],["c","x"]]),[2,3,4])
+        self.assertEqual(self.vault.get("a"),"new")
+        self.assertEqual(self.vault.get("a",version=1),"old")
+        self.assertEqual(self.vault.active_version("a"),2)
+        self.assertEqual([(r["name"],r["version"]) for r in self.vault.history("a")],
+                         [("a",1),("a",2)])
+        self.assertEqual([(v["name"],v["version"]) for v in self.vault.versions()],
+                         [("a",2),("b",3),("c",4)])
+        fresh=VersionedVault(self.root)
+        self.assertEqual(fresh.versions(),self.vault.versions())
+        self.assertEqual(fresh.history(),self.vault.history())
+    def test_rejected_containers_and_shapes(self):
+        for bad in (None,"ab",{"a":1},{1,2},[],(),[["a",1],["b",2]][:0]):
+            with self.assertRaises(ValueError,msg=repr(bad)):
+                self.vault.put_batch(bad)
+        for bad in ([1],[["a"]],[["a",1,2]],["ab"],[("a",)],[(1,2)],[[None,1]],[[1,"x"]],[["",1]]):
+            with self.assertRaises(ValueError,msg=repr(bad)):
+                self.vault.put_batch(bad)
+        self.assertFalse(self.root.exists())
+    def test_duplicate_names_rejected(self):
+        with self.assertRaises(ValueError):
+            self.vault.put_batch([["a",1],["a",2]])
+        with self.assertRaises(ValueError):
+            self.vault.put_batch([["a",1],["b",2],["a",3]])
+        self.assertFalse(self.root.exists())
+    def test_unstorable_value_rejects_whole_batch_as_typeerror(self):
+        target=Path(self._tmp.name)/"freshbatch"
+        w=VersionedVault(target)
+        with self.assertRaises(TypeError):
+            w.put_batch([["good",1],["bad",{1:"x"}]])
+        with self.assertRaises(TypeError):
+            w.put_batch([["bad",(1,2)]])
+        self.assertFalse(target.exists())
+        self.assertEqual(self.vault.put("k","v"),1)
+        before_bytes=self.log_bytes(); before=self.vault.versions()
+        with self.assertRaises(TypeError):
+            self.vault.put_batch([["k2","ok"],["k3",object()]])
+        self.assertEqual(self.log_bytes(),before_bytes)
+        self.assertEqual(self.vault.versions(),before)
+        self.assertEqual(self.vault.put("k2","ok"),2)
+    def test_failed_batch_keeps_bytes_state_and_next_version(self):
+        self.vault.put("a",1)
+        before_bytes=self.log_bytes(); before=self.vault.versions()
+        with self.assertRaises(ValueError):
+            self.vault.put_batch([["b",2],["b",3]])
+        self.assertEqual(self.log_bytes(),before_bytes)
+        self.assertEqual(self.vault.versions(),before)
+        self.assertEqual(self.vault.put("b",2),2)
+    def test_corrupt_log_blocks_batch_without_writes_or_state_change(self):
+        self.vault.put("a",1)
+        before=self.vault.versions(); good=self.log_bytes()
+        self.write_log(good.decode()+"not-json\n")
+        with self.assertRaisesRegex(ValueError,r"^invalid vault record$"):
+            self.vault.put_batch([["b",2],["c",3]])
+        self.assertEqual(self.vault.versions(),before)
+        self.assertEqual(self.log_bytes(),good+b"not-json\n")
+        self.write_log(good.decode())
+        self.assertEqual(self.vault.put_batch([["b",2],["c",3]]),[2,3])
+    def test_batch_records_match_existing_format_and_digest(self):
+        self.vault.put_batch([["a",{"k":[1,None]}],["b","x"]])
+        for line,version in zip(self.log_bytes().decode().splitlines(),(1,2)):
+            item=json.loads(line)
+            self.assertEqual(set(item),{"version","name","value","digest"})
+            self.assertEqual(item["version"],version)
+            self.assertEqual(item["digest"],VersionedVault._digest(item))
+    def test_batch_isolated_from_concurrent_put(self):
+        import threading
+        self.vault.put("seed",0)
+        barrier=threading.Barrier(2)
+        def batch():
+            barrier.wait()
+            self.vault.put_batch([["b",1],["c",2],["d",3]])
+        def single():
+            barrier.wait()
+            self.vault.put("e",4)
+        threads=[threading.Thread(target=batch),threading.Thread(target=single)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        records=self.vault.history()
+        self.assertEqual([r["version"] for r in records],[1,2,3,4,5])
+        # the batch occupies three consecutive versions: the single put lands
+        # entirely before or after it, never interleaved
+        names=[r["name"] for r in records]
+        self.assertIn(names[1:],(["b","c","d","e"],["e","b","c","d"]))
+
 if __name__=='__main__': unittest.main()

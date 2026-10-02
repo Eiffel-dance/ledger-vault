@@ -135,12 +135,16 @@ class VersionedVault:
         state=self._load()
         self._state=state
         return len(state.snapshot)
-    def _append_locked(self,name,value,expected_version):
-        # Shared body of put and put_if_version.  Every argument has already
-        # passed its side-effect-free validation; the in-process lock plus an
-        # exclusive flock serializes the whole revalidate-check-append sequence
-        # so that two conditional writers can never append against the same
-        # base version, as threads or as separate processes.
+    def _append_locked(self,items,expected_version):
+        # Shared body of put, put_if_version and put_batch.  `items` is a
+        # non-empty list of (name, value) pairs whose every argument has
+        # already passed its side-effect-free validation; the in-process lock
+        # plus an exclusive flock serializes the whole revalidate-check-append
+        # sequence so that two writers can never append against the same base
+        # version or interleave records, as threads or as separate processes.
+        # The whole batch is appended under this one coordination and published
+        # by a single reload, so readers only ever see the complete state from
+        # before or after the commit.  Returns the assigned versions in order.
         with self._write_lock:
             if self.log.exists():
                 # A read-only handle is enough to take the lock (flock contends
@@ -149,42 +153,47 @@ class VersionedVault:
                 # free of any filesystem side effect.
                 lock_handle=self.log.open("r",encoding="utf-8"); created=False
             else:
-                # The vault does not exist yet.  Rehearse against the empty
-                # chain BEFORE creating anything, preserving put's rule that an
-                # unstorable value never creates a directory; a conditional
-                # update then necessarily misses (no active version on disk).
-                self._build_line(name,value,1)
+                # The vault does not exist yet.  Rehearse every record against
+                # the empty chain BEFORE creating anything, preserving the rule
+                # that an unstorable value never creates a directory; a
+                # conditional update then necessarily misses (no active version
+                # on disk).
+                for offset,(name,value) in enumerate(items):
+                    self._build_line(name,value,offset+1)
                 if expected_version is not None:
-                    raise VersionConflictError(name,expected_version,None)
+                    raise VersionConflictError(items[0][0],expected_version,None)
                 self.root.mkdir(parents=True,exist_ok=True)
                 lock_handle=self.log.open("a",encoding="utf-8"); created=True
             try:
                 fcntl.flock(lock_handle.fileno(),fcntl.LOCK_EX)
-                # Revalidate the complete chain from disk under the lock so a
-                # new record is only appended when it attaches to the valid
-                # chain and the caller's base version is still active.  Another
+                # Revalidate the complete chain from disk under the lock so new
+                # records are only appended when they attach to the valid chain
+                # and the caller's base version is still active.  Another
                 # writer may have populated a just-created log before this lock
-                # was taken, so the version is always derived here.
+                # was taken, so the versions are always derived here.
                 state=self._load()
                 if expected_version is not None:
+                    name=items[0][0]
                     active=state.snapshot.get(name)
                     actual_version=active["version"] if active is not None else None
                     if actual_version!=expected_version:
                         # No bytes written and self._state is left untouched.
                         raise VersionConflictError(name,expected_version,actual_version)
-                version=len(state.records)+1
-                line=self._build_line(name,value,version)
+                base=len(state.records)
+                text="".join(self._build_line(name,value,base+offset+1)
+                             for offset,(name,value) in enumerate(items))
                 if created:
-                    lock_handle.write(line)
+                    lock_handle.write(text)
                 else:
                     with self.log.open("a",encoding="utf-8") as f:
-                        f.write(line)
+                        f.write(text)
             finally:
                 # Closing the append handle flushes its bytes before the lock
                 # is released, so any waiter revalidates against a chain that
-                # already includes the new record.
+                # already includes the new records.
                 lock_handle.close()
-            self.reload(); return version
+            self.reload()
+            return [base+offset+1 for offset in range(len(items))]
     def _build_line(self,name,value,version):
         item={"version":version,"name":name,"value":value}; item["digest"]=self._digest(item)
         line=json.dumps(item,sort_keys=True)+"\n"
@@ -207,7 +216,29 @@ class VersionedVault:
         # (coerced or duplicated keys, NaN/Infinity, tuple arrays) must fail as
         # TypeError without creating a directory, writing bytes, or touching state.
         self._ensure_storable(value)
-        return self._append_locked(name,value,None)
+        return self._append_locked([(name,value)],None)[0]
+    def put_batch(self,entries):
+        # Validate the whole batch before any filesystem or state access: the
+        # container, every element's shape, every name and every value are all
+        # checked by side-effect-free rules, so a rejected batch never creates
+        # a directory, opens the log, writes a byte or moves the next version.
+        if not isinstance(entries,(list,tuple)) or not entries:
+            raise ValueError("batch must be a non-empty list or tuple")
+        items=[]; seen=set()
+        for entry in entries:
+            if not isinstance(entry,(list,tuple)) or len(entry)!=2:
+                raise ValueError("batch entries must be (name, value) pairs")
+            name,value=entry
+            if not isinstance(name,str) or not name:
+                raise ValueError("name required")
+            if name in seen:
+                raise ValueError("duplicate name in batch")
+            seen.add(name); items.append((name,value))
+        # Same round-trip gate as put, run for every value up front so a single
+        # unstorable value rejects the whole batch as TypeError with no writes.
+        for name,value in items:
+            self._ensure_storable(value)
+        return self._append_locked(items,None)
     def put_if_version(self,name,expected_version,value):
         if not isinstance(name,str) or not name:
             raise ValueError("name required")
@@ -215,7 +246,7 @@ class VersionedVault:
             raise ValueError("expected_version must be a positive integer")
         # Same round-trip gate as put, run before any filesystem access.
         self._ensure_storable(value)
-        return self._append_locked(name,value,expected_version)
+        return self._append_locked([(name,value)],expected_version)[0]
     def get(self,name,version=None):
         state=self._state
         if version is None:
