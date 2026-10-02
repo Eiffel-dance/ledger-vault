@@ -1,5 +1,55 @@
-import argparse, copy, fcntl, hashlib, json, math, threading
+import argparse, contextlib, copy, hashlib, json, math, os, threading
 from pathlib import Path
+
+if os.name=="nt":
+    import errno, msvcrt, time
+else:
+    import fcntl
+
+# Cross-platform write coordination, standard library only.  Both branches
+# offer the same contract: _lock_file blocks until the caller owns the
+# vault-wide coordination and _unlock_file releases it, and the OS drops the
+# ownership by itself when the owning process dies, so a crashed writer can
+# never block later calls forever.  On POSIX this is a whole-file flock on
+# the log itself.  Windows has no flock; msvcrt.locking takes a byte-range
+# lock instead, so the lock sits at a fixed offset far beyond any real
+# record: the locked range then never overlaps record bytes, which keeps the
+# separate append handle (and any uncoordinated reader of the data) free of
+# ERROR_LOCK_VIOLATION while still giving every cooperative caller one common
+# rendezvous on the same file.  LK_NBLCK is retried because the blocking
+# LK_LOCK gives up after about ten seconds.
+_LOCK_OFFSET=1<<62
+if os.name=="nt":
+    def _lock_file(handle):
+        handle.seek(_LOCK_OFFSET)
+        while True:
+            try:
+                msvcrt.locking(handle.fileno(),msvcrt.LK_NBLCK,1)
+                return
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES,errno.EDEADLK):
+                    raise
+                time.sleep(0.05)
+    def _unlock_file(handle):
+        handle.seek(_LOCK_OFFSET)
+        msvcrt.locking(handle.fileno(),msvcrt.LK_UNLCK,1)
+else:
+    def _lock_file(handle):
+        fcntl.flock(handle.fileno(),fcntl.LOCK_EX)
+    def _unlock_file(handle):
+        fcntl.flock(handle.fileno(),fcntl.LOCK_UN)
+
+@contextlib.contextmanager
+def _file_lock(handle):
+    # Hold the coordination for the duration of the with-block and release it
+    # on every exit path — success, ValueError, TypeError,
+    # VersionConflictError and underlying I/O errors alike.  If the lock
+    # itself cannot be taken there is nothing to release.
+    _lock_file(handle)
+    try:
+        yield
+    finally:
+        _unlock_file(handle)
 
 class VersionConflictError(Exception):
     # Raised by put_if_version when the active version on disk no longer
@@ -17,12 +67,24 @@ class _State:
         self.snapshot=snapshot; self.records=records; self.by_version=by_version
 
 class VersionedVault:
+    # In-process users of the same root are serialized through one lock per
+    # log file, shared by every instance of this process: on some local
+    # filesystems the OS file lock only arbitrates between processes, and a
+    # Windows byte-range lock is not a reliable mutual exclusion between two
+    # handles of the same process either, so threads of one process must never
+    # rely on the file lock alone.
+    _registry_lock=threading.Lock()
+    _write_locks={}
     def __init__(self, root="vault"):
         self.root=Path(root); self.log=self.root/"versions.jsonl"
         self._state=_State({},(),{})
-        # In-process writers are serialized too: on some local filesystems
-        # flock only arbitrates between processes, not threads in one process.
-        self._write_lock=threading.RLock()
+        key=os.path.normcase(os.path.abspath(self.log))
+        with VersionedVault._registry_lock:
+            lock=VersionedVault._write_locks.get(key)
+            if lock is None:
+                lock=threading.RLock()
+                VersionedVault._write_locks[key]=lock
+        self._write_lock=lock
         self.reload()
     @staticmethod
     def _digest(item):
@@ -131,23 +193,39 @@ class VersionedVault:
     def reload(self):
         # Build the complete new state first; only replace the snapshot once
         # the whole chain has validated, so readers never see an intermediate
-        # state and a corrupt log leaves the previous snapshot untouched.
-        state=self._load()
-        self._state=state
-        return len(state.snapshot)
-    def _append_locked(self,name,value,expected_version):
-        # Shared body of put and put_if_version.  Every argument has already
-        # passed its side-effect-free validation; the in-process lock plus an
-        # exclusive flock serializes the whole revalidate-check-append sequence
-        # so that two conditional writers can never append against the same
-        # base version, as threads or as separate processes.
+        # state and a corrupt log leaves the previous snapshot untouched.  The
+        # read runs under the same coordination as the writers: a reload that
+        # arrives while another thread or process is mid-commit waits for the
+        # append to finish, so it can only ever read the complete pre-commit
+        # or post-commit chain, never half a record or the middle of a batch.
+        # A vault without a log is simply empty, and a read never creates a
+        # file or directory.
         with self._write_lock:
             if self.log.exists():
-                # A read-only handle is enough to take the lock (flock contends
-                # on the inode, so this also serializes against writers that
-                # opened the log in append mode) and leaves a conditional miss
-                # free of any filesystem side effect.
-                lock_handle=self.log.open("r",encoding="utf-8"); created=False
+                lock_handle=self.log.open("rb")
+                try:
+                    with _file_lock(lock_handle):
+                        state=self._load()
+                finally:
+                    lock_handle.close()
+            else:
+                state=self._load()
+            self._state=state
+            return len(state.snapshot)
+    def _append_locked(self,name,value,expected_version):
+        # Shared body of put and put_if_version.  Every argument has already
+        # passed its side-effect-free validation; the in-process per-root lock
+        # plus the cross-platform file lock serializes the whole
+        # revalidate-check-append sequence so that two conditional writers can
+        # never append against the same base version, as threads or as
+        # separate processes, on POSIX and on Windows alike.
+        with self._write_lock:
+            if self.log.exists():
+                # A binary read-only handle is enough to take the lock (flock
+                # contends on the inode, LockFile only needs read access, and
+                # the Windows lock range sits past the end of the data), and
+                # leaves a conditional miss free of any filesystem side effect.
+                lock_handle=self.log.open("rb")
             else:
                 # The vault does not exist yet.  Rehearse against the empty
                 # chain BEFORE creating anything, preserving put's rule that an
@@ -157,31 +235,31 @@ class VersionedVault:
                 if expected_version is not None:
                     raise VersionConflictError(name,expected_version,None)
                 self.root.mkdir(parents=True,exist_ok=True)
-                lock_handle=self.log.open("a",encoding="utf-8"); created=True
+                lock_handle=self.log.open("ab")
             try:
-                fcntl.flock(lock_handle.fileno(),fcntl.LOCK_EX)
-                # Revalidate the complete chain from disk under the lock so a
-                # new record is only appended when it attaches to the valid
-                # chain and the caller's base version is still active.  Another
-                # writer may have populated a just-created log before this lock
-                # was taken, so the version is always derived here.
-                state=self._load()
-                if expected_version is not None:
-                    active=state.snapshot.get(name)
-                    actual_version=active["version"] if active is not None else None
-                    if actual_version!=expected_version:
-                        # No bytes written and self._state is left untouched.
-                        raise VersionConflictError(name,expected_version,actual_version)
-                version=len(state.records)+1
-                line=self._build_line(name,value,version)
-                if created:
-                    lock_handle.write(line)
-                else:
+                with _file_lock(lock_handle):
+                    # Revalidate the complete chain from disk under the lock so
+                    # a new record is only appended when it attaches to the
+                    # valid chain and the caller's base version is still
+                    # active.  Another writer may have populated a just-created
+                    # log before this lock was taken, so the version is always
+                    # derived here.
+                    state=self._load()
+                    if expected_version is not None:
+                        active=state.snapshot.get(name)
+                        actual_version=active["version"] if active is not None else None
+                        if actual_version!=expected_version:
+                            # No bytes written and self._state is left untouched.
+                            raise VersionConflictError(name,expected_version,actual_version)
+                    version=len(state.records)+1
+                    line=self._build_line(name,value,version)
                     with self.log.open("a",encoding="utf-8") as f:
                         f.write(line)
             finally:
-                # Closing the append handle flushes its bytes before the lock
-                # is released, so any waiter revalidates against a chain that
+                # Closing the lock handle (after _file_lock has unlocked it)
+                # happens on every exit path, and the append handle above is
+                # already closed — its bytes flushed — before the lock is
+                # released, so any waiter revalidates against a chain that
                 # already includes the new record.
                 lock_handle.close()
             self.reload(); return version
@@ -190,40 +268,40 @@ class VersionedVault:
         # side-effect-free validation (including the _build_line rehearsal), so
         # nothing here can fail with TypeError; a corrupt chain still surfaces
         # as ValueError from the locked revalidation before any byte is written.
-        # The in-process lock plus an exclusive flock serializes the whole
-        # revalidate-append sequence against every other put/put_batch, as
-        # threads or as separate processes, so no record can interleave into
-        # the batch's consecutive version range.
+        # The in-process per-root lock plus the cross-platform file lock
+        # serializes the whole revalidate-append sequence against every other
+        # put/put_batch, as threads or as separate processes, on POSIX and on
+        # Windows alike, so no record can interleave into the batch's
+        # consecutive version range.
         with self._write_lock:
             if self.log.exists():
-                # Same read-only lock handle as _append_locked: flock contends
-                # on the inode, and a corrupt chain is detected without any
-                # filesystem side effect.
-                lock_handle=self.log.open("r",encoding="utf-8"); created=False
+                # Same binary read-only lock handle as _append_locked: the
+                # lock contends on the file itself, and a corrupt chain is
+                # detected without any filesystem side effect.
+                lock_handle=self.log.open("rb")
             else:
                 # Validation already rehearsed every record above, so reaching
                 # this point cannot fail; only now may the directory be created.
                 self.root.mkdir(parents=True,exist_ok=True)
-                lock_handle=self.log.open("a",encoding="utf-8"); created=True
+                lock_handle=self.log.open("ab")
             try:
-                fcntl.flock(lock_handle.fileno(),fcntl.LOCK_EX)
-                # Revalidate the complete chain from disk under the lock; the
-                # batch's versions are always derived from the chain found here
-                # because another process may have appended before the lock was
-                # taken.  A corrupt chain raises ValueError before any write.
-                state=self._load()
-                base=len(state.records)
-                text="".join(self._build_line(name,value,base+index+1)
-                             for index,(name,value) in enumerate(pairs))
-                if created:
-                    lock_handle.write(text)
-                else:
+                with _file_lock(lock_handle):
+                    # Revalidate the complete chain from disk under the lock;
+                    # the batch's versions are always derived from the chain
+                    # found here because another process may have appended
+                    # before the lock was taken.  A corrupt chain raises
+                    # ValueError before any write.
+                    state=self._load()
+                    base=len(state.records)
+                    text="".join(self._build_line(name,value,base+index+1)
+                                 for index,(name,value) in enumerate(pairs))
                     with self.log.open("a",encoding="utf-8") as f:
                         f.write(text)
             finally:
-                # Closing flushes the bytes before the lock is released, so any
-                # waiter revalidates against a chain that already includes the
-                # whole batch.
+                # The append handle above is already closed — its bytes
+                # flushed — before the coordination is released on every exit
+                # path, so any waiter revalidates against a chain that already
+                # includes the whole batch.
                 lock_handle.close()
             self.reload()
             return [base+index+1 for index in range(len(pairs))]
