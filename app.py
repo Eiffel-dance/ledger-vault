@@ -185,6 +185,48 @@ class VersionedVault:
                 # already includes the new record.
                 lock_handle.close()
             self.reload(); return version
+    def _append_batch_locked(self,pairs):
+        # Shared append body of put_batch.  Every pair has already passed its
+        # side-effect-free validation (including the _build_line rehearsal), so
+        # nothing here can fail with TypeError; a corrupt chain still surfaces
+        # as ValueError from the locked revalidation before any byte is written.
+        # The in-process lock plus an exclusive flock serializes the whole
+        # revalidate-append sequence against every other put/put_batch, as
+        # threads or as separate processes, so no record can interleave into
+        # the batch's consecutive version range.
+        with self._write_lock:
+            if self.log.exists():
+                # Same read-only lock handle as _append_locked: flock contends
+                # on the inode, and a corrupt chain is detected without any
+                # filesystem side effect.
+                lock_handle=self.log.open("r",encoding="utf-8"); created=False
+            else:
+                # Validation already rehearsed every record above, so reaching
+                # this point cannot fail; only now may the directory be created.
+                self.root.mkdir(parents=True,exist_ok=True)
+                lock_handle=self.log.open("a",encoding="utf-8"); created=True
+            try:
+                fcntl.flock(lock_handle.fileno(),fcntl.LOCK_EX)
+                # Revalidate the complete chain from disk under the lock; the
+                # batch's versions are always derived from the chain found here
+                # because another process may have appended before the lock was
+                # taken.  A corrupt chain raises ValueError before any write.
+                state=self._load()
+                base=len(state.records)
+                text="".join(self._build_line(name,value,base+index+1)
+                             for index,(name,value) in enumerate(pairs))
+                if created:
+                    lock_handle.write(text)
+                else:
+                    with self.log.open("a",encoding="utf-8") as f:
+                        f.write(text)
+            finally:
+                # Closing flushes the bytes before the lock is released, so any
+                # waiter revalidates against a chain that already includes the
+                # whole batch.
+                lock_handle.close()
+            self.reload()
+            return [base+index+1 for index in range(len(pairs))]
     def _build_line(self,name,value,version):
         item={"version":version,"name":name,"value":value}; item["digest"]=self._digest(item)
         line=json.dumps(item,sort_keys=True)+"\n"
@@ -208,6 +250,38 @@ class VersionedVault:
         # TypeError without creating a directory, writing bytes, or touching state.
         self._ensure_storable(value)
         return self._append_locked(name,value,None)
+    def put_batch(self,items):
+        # Append several named configs as one commit.  `items` must be a
+        # non-empty list or tuple of (name, value) pairs, each itself a
+        # two-element list or tuple; names must be non-empty strings and may
+        # not repeat within the batch.  Every structural problem is a
+        # ValueError, every unstorable value a TypeError, and ALL of these
+        # checks run before any directory is created, any log is opened or any
+        # in-memory state changes, so a rejected batch leaves disk bytes, the
+        # snapshot and the next version number untouched (a fresh root is not
+        # created either).
+        if not isinstance(items,(list,tuple)) or not items:
+            raise ValueError("batch must be a non-empty list or tuple")
+        pairs=[]; seen=set()
+        for element in items:
+            if not isinstance(element,(list,tuple)) or len(element)!=2:
+                raise ValueError("batch elements must be (name, value) pairs")
+            name,value=element
+            if not isinstance(name,str) or not name:
+                raise ValueError("name required")
+            if name in seen:
+                raise ValueError("duplicate name in batch")
+            seen.add(name)
+            pairs.append((name,value))
+        # Same round-trip gate as put, applied to every value up front: first
+        # the pure serializability/key checks, then a full rehearsal of each
+        # record's exact bytes so a tuple array or other reload-mismatch fails
+        # here as TypeError instead of surfacing after the log was opened.
+        for name,value in pairs:
+            self._ensure_storable(value)
+        for index,(name,value) in enumerate(pairs):
+            self._build_line(name,value,index+1)
+        return self._append_batch_locked(pairs)
     def put_if_version(self,name,expected_version,value):
         if not isinstance(name,str) or not name:
             raise ValueError("name required")

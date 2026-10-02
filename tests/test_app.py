@@ -216,4 +216,67 @@ class DuplicateMemberTest(_VaultCase):
         self.assertEqual(self.vault.put("a",3),2)
         self.assertEqual(VersionedVault(self.root).get("a"),3)
 
+class PutBatchTest(_VaultCase):
+    def test_batch_appends_in_order_and_returns_versions(self):
+        self.assertEqual(self.vault.put("a",0),1)
+        result=self.vault.put_batch([["b",1],("c",[1,2]),("a",{"x":True})])
+        self.assertEqual(result,[2,3,4])
+        self.assertEqual(self.vault.get("b"),1)
+        self.assertEqual(self.vault.get("c"),[1,2])
+        self.assertEqual(self.vault.get("a"),{"x":True})
+        # versions() reflects only each name's last record; history keeps all
+        self.assertEqual([(r["name"],r["version"]) for r in self.vault.versions()],
+                         [("a",4),("b",2),("c",3)])
+        self.assertEqual([r["version"] for r in self.vault.history()],[1,2,3,4])
+        self.assertEqual([(r["name"],r["version"]) for r in self.vault.history("a")],
+                         [("a",1),("a",4)])
+        # old history of an updated name is preserved
+        self.assertEqual(self.vault.get("a",version=1),0)
+        self.assertEqual(self.vault.active_version("a"),4)
+        # the batch chains and reloads identically in a fresh instance
+        fresh=VersionedVault(self.root)
+        self.assertEqual(fresh.versions(),self.vault.versions())
+        self.assertEqual(fresh.history(),self.vault.history())
+    def test_tuple_batch_and_single_element(self):
+        self.assertEqual(self.vault.put_batch((("k","v"),)),[1])
+        self.assertEqual(self.vault.get("k"),"v")
+    def test_rejected_shape_and_names(self):
+        bad=([],(),None,"ab",[[ "a",1],["a",2]],[["",1]],[[None,1]],
+             [[1,1]],[["a"]],[["a",1,2]],["ab"],[["a",1],"bc"])
+        for items in bad:
+            with self.assertRaises(ValueError,msg=repr(items)):
+                self.vault.put_batch(items)
+        self.assertFalse(self.root.exists())
+        self.assertEqual(self.vault.put("k",1),1)
+    def test_unstorable_value_is_type_error_without_side_effects(self):
+        target=Path(self._tmp.name)/"fresh_batch"
+        w=VersionedVault(target)
+        for bad_value in ({1:"x"},(1,2),{"a":(2,3)},object()):
+            with self.assertRaises(TypeError,msg=repr(bad_value)):
+                w.put_batch([["ok",1],["bad",bad_value]])
+        self.assertFalse(target.exists())
+        self.assertEqual(w.put("ok",1),1)
+    def test_failed_batch_keeps_bytes_snapshot_and_next_version(self):
+        self.assertEqual(self.vault.put("a",1),1)
+        before_versions=self.vault.versions()
+        before_bytes=self.log_bytes()
+        with self.assertRaises(ValueError):
+            self.vault.put_batch([["b",2],["b",3]])
+        with self.assertRaises(TypeError):
+            self.vault.put_batch([["b",2],["c",{1:"x"}]])
+        self.assertEqual(self.vault.versions(),before_versions)
+        self.assertEqual(self.log_bytes(),before_bytes)
+        self.assertEqual(self.vault.put("b",2),2)
+    def test_corrupt_log_blocks_batch_without_appending(self):
+        self.vault.put("a",1)
+        before=self.vault.versions()
+        good=self.log_bytes()
+        self.write_log(good.decode()+"not-json\n")
+        with self.assertRaisesRegex(ValueError,r"^invalid vault record$"):
+            self.vault.put_batch([["b",2],["c",3]])
+        self.assertEqual(self.vault.versions(),before)
+        self.assertEqual(self.log_bytes(),good+b"not-json\n")
+        self.write_log(good.decode())
+        self.assertEqual(self.vault.put_batch([["b",2],["c",3]]),[2,3])
+
 if __name__=='__main__': unittest.main()
