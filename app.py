@@ -68,9 +68,21 @@ class VersionedVault:
             return len(left)==len(right) and all(
                 VersionedVault._json_equal(x,y) for x,y in zip(left,right))
         return left==right
+    @staticmethod
+    def _unique_object(pairs):
+        # object_pairs_hook for log parsing: keys arrive already decoded, so
+        # two members that are the same name after unescaping ("a" vs "a")
+        # collide here even when their raw spellings differ.  Any duplicate in
+        # any object at any depth makes the whole record ambiguous and invalid.
+        obj={}
+        for key,value in pairs:
+            if key in obj:
+                raise ValueError("invalid vault record")
+            obj[key]=value
+        return obj
     def _parse_record(self,line,previous):
         try:
-            item=json.loads(line)
+            item=json.loads(line,object_pairs_hook=VersionedVault._unique_object)
         except ValueError:
             raise ValueError("invalid vault record")
         if not isinstance(item,dict) or set(item)!={"version","name","value","digest"}:
