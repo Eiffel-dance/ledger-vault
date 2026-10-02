@@ -155,10 +155,31 @@ class VersionedVault:
         return [{"name":k,"version":v["version"],"value":copy.deepcopy(v["value"])}
                 for k,v in sorted(self._state.snapshot.items())]
 if __name__=="__main__":
-    p=argparse.ArgumentParser(); p.add_argument("command",choices=("put","get","versions","active","history")); p.add_argument("--root",default="vault"); p.add_argument("--name"); p.add_argument("--value"); p.add_argument("--version",type=int); a=p.parse_args(); v=VersionedVault(a.root)
+    p=argparse.ArgumentParser()
+    p.add_argument("command",choices=("put","get","versions","active","history"))
+    p.add_argument("--root",default="vault"); p.add_argument("--name")
+    p.add_argument("--value",help="string to store for put, written as-is (mutually exclusive with --value-json)")
+    p.add_argument("--value-json",metavar="JSON",
+                   help="complete JSON document to store for put; the parsed object, array, number, "
+                        "boolean or null keeps its type on later reads (mutually exclusive with --value)")
+    p.add_argument("--version",type=int)
+    p.add_argument("--json",action="store_true",
+                   help="for get: print the value as a single JSON document parseable by json.loads, "
+                        "with sorted object keys and unescaped Unicode like versions/history output")
+    a=p.parse_args()
+    if a.command=="put" and a.value is not None and a.value_json is not None:
+        # Reject before any record is appended or a version number is printed.
+        p.exit(1,"error: --value and --value-json are mutually exclusive\n")
+    value=a.value
+    if a.command=="put" and a.value_json is not None:
+        try: value=json.loads(a.value_json)
+        except ValueError: p.exit(1,"error: --value-json is not a complete JSON document\n")
+    v=VersionedVault(a.root)
     try:
-        if a.command=="put": print(v.put(a.name,a.value))
-        elif a.command=="get": print(v.get(a.name) if a.version is None else v.get(a.name,a.version))
+        if a.command=="put": print(v.put(a.name,value))
+        elif a.command=="get":
+            got=v.get(a.name) if a.version is None else v.get(a.name,a.version)
+            print(json.dumps(got,ensure_ascii=False,sort_keys=True) if a.json else got)
         elif a.command=="versions": print(json.dumps(v.versions(),ensure_ascii=False,sort_keys=True))
         elif a.command=="active": print(v.active_version(a.name))
         else: print(json.dumps(v.history(a.name),ensure_ascii=False,sort_keys=True))

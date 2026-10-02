@@ -1,7 +1,9 @@
-import json, math, unittest
+import json, math, subprocess, sys, unittest
 from pathlib import Path
 import app
 from app import VersionedVault
+
+APP=Path(app.__file__).resolve()
 
 class _VaultCase(unittest.TestCase):
     def setUp(self):
@@ -136,5 +138,83 @@ class PersistenceTest(_VaultCase):
         self.write_log(good_bytes.decode())
         self.assertEqual(self.vault.put("a",3),2)
         self.assertEqual(self.vault.get("a"),3)
+
+class CliTest(_VaultCase):
+    def run_cli(self,*args):
+        return subprocess.run([sys.executable,str(APP),"--root",str(self.root),*args],
+                              capture_output=True,text=True)
+    def cli_get(self,name):
+        # read back what the CLI subprocess wrote through a fresh reload
+        self.vault.reload()
+        return self.vault.get(name)
+    def test_put_value_json_round_trips_types(self):
+        doc='{"b":[1,2.5,true,false,null],"a":{"x":"y"}}'
+        r=self.run_cli("put","--name","cfg","--value-json",doc)
+        self.assertEqual(r.returncode,0)
+        self.assertEqual(r.stdout.strip(),"1")
+        self.assertEqual(self.cli_get("cfg"),{"a":{"x":"y"},"b":[1,2.5,True,False,None]})
+        # CLI and Python interface read the same JSON values
+        r=self.run_cli("get","--name","cfg","--json")
+        self.assertEqual(r.returncode,0)
+        self.assertEqual(json.loads(r.stdout),self.cli_get("cfg"))
+        self.assertEqual(r.stdout.strip(),
+                         json.dumps(self.cli_get("cfg"),ensure_ascii=False,sort_keys=True))
+    def test_put_value_json_scalars(self):
+        for doc,expected in (("42",42),("3.5",3.5),("true",True),("null",None),
+                             ('"s"',"s"),("[1,2]",[1,2])):
+            r=self.run_cli("put","--name","k","--value-json",doc)
+            self.assertEqual(r.returncode,0,doc)
+            self.assertEqual(self.cli_get("k"),expected)
+            self.assertIs(type(self.cli_get("k")),type(expected))
+    def test_put_value_json_invalid_writes_nothing(self):
+        for bad in ('{"a":1','not json','{"a":1} trailing','',"{'a':1}"):
+            r=self.run_cli("put","--name","k","--value-json",bad)
+            self.assertEqual(r.returncode,1,bad)
+            self.assertEqual(r.stdout,"")
+        self.assertFalse((self.root/"versions.jsonl").exists())
+        self.assertEqual(self.vault.versions(),[])
+    def test_put_value_and_value_json_conflict(self):
+        r=self.run_cli("put","--name","k","--value","s","--value-json","{}")
+        self.assertEqual(r.returncode,1)
+        self.assertEqual(r.stdout,"")
+        self.assertFalse((self.root/"versions.jsonl").exists())
+        # argument order does not matter
+        r=self.run_cli("put","--value-json","{}","--name","k","--value","s")
+        self.assertEqual(r.returncode,1)
+        self.assertFalse((self.root/"versions.jsonl").exists())
+    def test_put_plain_value_unchanged(self):
+        r=self.run_cli("put","--name","k","--value",'{"a":1}')
+        self.assertEqual(r.returncode,0)
+        self.assertEqual(r.stdout.strip(),"1")
+        self.assertEqual(self.cli_get("k"),'{"a":1}')
+        r=self.run_cli("put","--name","n")  # omitted value keeps existing result
+        self.assertEqual(r.returncode,0)
+        self.assertIsNone(self.cli_get("n"))
+    def test_get_json_output_conventions(self):
+        self.vault.put("k",{"z":"é","a":[1,None]})
+        r=self.run_cli("get","--name","k","--json")
+        self.assertEqual(r.returncode,0)
+        self.assertEqual(json.loads(r.stdout),{"a":[1,None],"z":"é"})
+        self.assertIn("é",r.stdout)  # unescaped Unicode like versions/history
+        self.assertLess(r.stdout.find('"a"'),r.stdout.find('"z"'))  # sorted keys
+        # default get output unchanged: the plain str() of the value
+        r=self.run_cli("get","--name","k")
+        self.assertEqual(r.returncode,0)
+        self.assertEqual(r.stdout.strip(),str(self.vault.get("k")))
+        # --json also applies to a named version read
+        self.vault.put("k",2)
+        r=self.run_cli("get","--name","k","--version","1","--json")
+        self.assertEqual(json.loads(r.stdout),{"a":[1,None],"z":"é"})
+    def test_cli_failures_exit_1_without_writes(self):
+        self.vault.put("a",1)
+        good=self.log_bytes()
+        for args in (("get","--name","missing","--json"),
+                     ("get","--name","a","--version","9","--json"),
+                     ("put","--name","k","--value-json",'{1:"x"}'),
+                     ("put","--name","k","--value-json",'{"a":1} extra')):
+            r=self.run_cli(*args)
+            self.assertEqual(r.returncode,1,args)
+            self.assertEqual(r.stdout,"")
+            self.assertEqual(self.log_bytes(),good)
 
 if __name__=='__main__': unittest.main()
