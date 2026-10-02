@@ -236,9 +236,32 @@ class VersionedVault:
     def versions(self):
         return [{"name":k,"version":v["version"],"value":copy.deepcopy(v["value"])}
                 for k,v in sorted(self._state.snapshot.items())]
+    def snapshot_at(self,version=None):
+        # Read-only whole-repository view as of the first `version` global
+        # records: 0 is an empty snapshot, omitting the point (or passing the
+        # latest number) reproduces the currently loaded state.  The published
+        # _State is captured once and never mutated after publication, so a
+        # concurrent reload can only expose the complete old or new state,
+        # never a mix.  Nothing here touches disk, the active version or the
+        # log, and every returned value is a fresh deep copy.
+        state=self._state
+        if version is None:
+            records=state.records
+        else:
+            if not isinstance(version,int) or isinstance(version,bool) or version<0:
+                raise ValueError("version must be a non-negative integer")
+            total=len(state.records)
+            if version>total:
+                raise ValueError("version must not exceed the number of loaded records")
+            records=state.records[:version]
+        snapshot={}
+        for r in records:
+            snapshot[r["name"]]={"version":r["version"],"value":r["value"]}
+        return [{"name":k,"version":v["version"],"value":copy.deepcopy(v["value"])}
+                for k,v in sorted(snapshot.items())]
 if __name__=="__main__":
     p=argparse.ArgumentParser(description="VersionedVault command line")
-    p.add_argument("command",choices=("put","get","versions","active","history"))
+    p.add_argument("command",choices=("put","get","versions","active","history","snapshot"))
     p.add_argument("--root",default="vault")
     p.add_argument("--name")
     p.add_argument("--value",help="write the argument verbatim as a string; mutually exclusive with --value-json")
@@ -247,7 +270,9 @@ if __name__=="__main__":
                         "value (objects, arrays, numbers, booleans and null keep their type); "
                         "mutually exclusive with --value: giving both, or passing text that is "
                         "not a complete JSON document, exits with status 1 without appending a record")
-    p.add_argument("--version",type=int)
+    p.add_argument("--version",
+                   help="record/global sequence number: selects one named version for get, "
+                        "or a whole-repository point in time (0 = empty snapshot) for snapshot")
     p.add_argument("--if-version",dest="if_version",
                    help="only for put: append only when the named config's active "
                         "version equals N; a missing name or a stale N exits with "
@@ -287,7 +312,16 @@ if __name__=="__main__":
             else:
                 print(v.put(a.name,value))
         elif a.command=="get":
-            value=v.get(a.name) if a.version is None else v.get(a.name,a.version)
+            if a.version is None:
+                value=v.get(a.name)
+            else:
+                # argparse-typed integer semantics are kept for get: malformed
+                # input reports argument failure (status 2), not the unified 1.
+                try:
+                    get_version=int(a.version,10)
+                except ValueError:
+                    p.error("argument --version: invalid int value: %r"%a.version)
+                value=v.get(a.name,get_version)
             if a.json_output:
                 print(json.dumps(value,ensure_ascii=False,sort_keys=True))
             else:
@@ -296,6 +330,22 @@ if __name__=="__main__":
             print(json.dumps(v.versions(),ensure_ascii=False,sort_keys=True))
         elif a.command=="active":
             print(v.active_version(a.name))
+        elif a.command=="snapshot":
+            if a.version is None:
+                point=None
+            else:
+                # Parsed by hand, like put's --if-version: malformed text,
+                # fractions and negative numbers all take the unified failure
+                # path (status 1, nothing printed) instead of argparse's 2.
+                try:
+                    point=int(a.version,10)
+                except ValueError:
+                    raise SystemExit(1)
+                if point<0:
+                    raise SystemExit(1)
+            # An out-of-range point raises ValueError from snapshot_at and is
+            # handled below, again with no partial output.
+            print(json.dumps(v.snapshot_at(point),ensure_ascii=False,sort_keys=True))
         else:
             print(json.dumps(v.history(a.name),ensure_ascii=False,sort_keys=True))
     except (KeyError,ValueError,TypeError,VersionConflictError):
