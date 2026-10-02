@@ -57,23 +57,50 @@ class VersionedVault:
         state=self._load()
         self._state=state
         return len(state.snapshot)
+    @staticmethod
+    def _no_duplicate_keys(pairs):
+        # Operates on the already-encoded keys, so this also catches Python
+        # keys that dumps() maps onto the same JSON key (1/"1", True/"true",
+        # None/"null", 1.0/"1.0", multiple NaNs...). Applies to every nested
+        # object as well.
+        seen=set()
+        for key,_ in pairs:
+            if key in seen:
+                raise ValueError("duplicate key")
+            seen.add(key)
+        return dict(pairs)
+    def _stable_line(self,name,value,version):
+        # Determine persistence semantics before mkdir, open-log, or any state
+        # change. The candidate record must (1) encode with the exact writer
+        # settings, (2) decode the way reload() decodes it without an object
+        # merging or losing keys, and (3) reproduce byte-identical JSON and a
+        # valid digest after decoding, so the in-memory view and a fresh
+        # cross-instance load are the same JSON value. Everything else is a
+        # caller (type) error, unified as TypeError.
+        item={"version":version,"name":name,"value":value}
+        try:
+            item["digest"]=self._digest(item)
+            text=json.dumps(item,sort_keys=True)
+            decoded=json.loads(text,object_pairs_hook=self._no_duplicate_keys)
+            if json.dumps(decoded,sort_keys=True)!=text:
+                raise ValueError("value does not round-trip")
+            if decoded["digest"]!=self._digest(decoded):
+                raise ValueError("digest does not round-trip")
+        except (TypeError,ValueError) as exc:
+            raise TypeError("value is not JSON serializable") from exc
+        return text+"\n"
     def put(self,name,value):
         if not isinstance(name,str) or not name:
             raise ValueError("name required")
-        # Encode before opening the log: an unencodable value raises TypeError
-        # without creating a directory, writing bytes, or touching state.
-        try:
-            json.dumps(value)
-        except (TypeError, ValueError):
-            # Circular references surface as ValueError from json; unify them
-            # with every other encoding failure as TypeError.
-            raise TypeError("value is not JSON serializable")
         # Revalidate the complete chain from disk so a new record is only
-        # appended when it can attach to the existing valid chain.
+        # appended when it can attach to the existing valid chain. Corruption
+        # stays a ValueError and is never repaired by appending past it;
+        # _load builds a fresh state without touching live state or disk.
         state=self._load()
         version=len(state.records)+1
-        item={"version":version,"name":name,"value":value}; item["digest"]=self._digest(item)
-        line=json.dumps(item,sort_keys=True)+"\n"
+        # Encode the record and replay it through the reload rules before
+        # creating a directory, opening the log, or changing in-memory state.
+        line=self._stable_line(name,value,version)
         self.root.mkdir(parents=True,exist_ok=True)
         with self.log.open("a",encoding="utf-8") as f: f.write(line)
         self.reload(); return version
