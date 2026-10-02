@@ -68,9 +68,24 @@ class VersionedVault:
             return len(left)==len(right) and all(
                 VersionedVault._json_equal(x,y) for x,y in zip(left,right))
         return left==right
+    @staticmethod
+    def _object_from_pairs(pairs):
+        # object_pairs_hook fires for every JSON object at every depth,
+        # including the record itself, and hands us every member before
+        # json.loads collapses same-named members onto one dict entry.  Names
+        # are already decoded, so "a" and "a" compare equal; two members
+        # decoding to the same name make the text ambiguous and corrupt the
+        # record, even though last-wins parsing would still reproduce a
+        # matching digest.
+        seen=set()
+        for key,_item in pairs:
+            if key in seen:
+                raise ValueError("invalid vault record")
+            seen.add(key)
+        return dict(pairs)
     def _parse_record(self,line,previous):
         try:
-            item=json.loads(line)
+            item=json.loads(line,object_pairs_hook=self._object_from_pairs)
         except ValueError:
             raise ValueError("invalid vault record")
         if not isinstance(item,dict) or set(item)!={"version","name","value","digest"}:

@@ -137,4 +137,83 @@ class PersistenceTest(_VaultCase):
         self.assertEqual(self.vault.put("a",3),2)
         self.assertEqual(self.vault.get("a"),3)
 
+class DuplicateMemberTest(_VaultCase):
+    def assert_invalid_log(self,text):
+        self.write_log(text+"\n")
+        with self.assertRaisesRegex(ValueError,r"^invalid vault record$"):
+            VersionedVault(self.root)
+    def _digest(self,value,name="k",version=1):
+        rec={"version":version,"name":name,"value":value}
+        return VersionedVault._digest(rec)
+    def test_duplicate_root_member_matching_digest_is_corrupt(self):
+        # Ordinary last-wins parsing collapses the repeated member and still
+        # reproduces the stored digest; the ambiguity alone must be rejected.
+        text='{"version":1,"name":"k","value":1,"value":1,"digest":%s}'%json.dumps(self._digest(1))
+        self.assertEqual(json.loads(text)["digest"],self._digest(1))
+        self.assert_invalid_log(text)
+    def test_differing_duplicate_root_member_is_corrupt(self):
+        text='{"version":1,"name":"k","value":1,"value":2,"digest":%s}'%json.dumps(self._digest(2))
+        self.assertEqual(json.loads(text)["digest"],self._digest(2))
+        self.assert_invalid_log(text)
+    def test_escape_variants_decoding_to_same_name_are_duplicates(self):
+        text=('{"version":1,"na\\u006de":"k","name":"k","value":1,"digest":%s}'
+              %json.dumps(self._digest(1)))
+        self.assertEqual(json.loads(text)["name"],"k")
+        self.assert_invalid_log(text)
+    def test_duplicate_members_nested_in_value_are_corrupt(self):
+        text='{"version":1,"name":"k","value":{"a":1,"a":2},"digest":%s}'%json.dumps(self._digest({"a":2}))
+        self.assertEqual(json.loads(text)["digest"],self._digest({"a":2}))
+        self.assert_invalid_log(text)
+        escaped='{"version":1,"name":"k","value":{"a":1,"\\u0061":2},"digest":%s}'%json.dumps(self._digest({"a":2}))
+        self.assert_invalid_log(escaped)
+    def test_duplicate_member_inside_nested_array_element_is_corrupt(self):
+        text='{"version":1,"name":"k","value":[{"x":1},{"x":1,"x":2}],"digest":%s}'%json.dumps(
+            self._digest([{"x":1},{"x":2}]))
+        self.assertEqual(json.loads(text)["digest"],self._digest([{"x":1},{"x":2}]))
+        self.assert_invalid_log(text)
+    def test_same_member_name_in_sibling_objects_and_empty_objects_valid(self):
+        value={"x":{"y":1},"z":{"y":2},"empty":{},"list":[{},{}]}
+        rec={"version":1,"name":"k","value":value}
+        rec["digest"]=VersionedVault._digest(rec)
+        # reordered record fields and extra whitespace keep their semantics
+        text='{ "digest": %s ,  "name": "k", "value": {"x": {"y": 1}, "z": {"y": 2}, "empty": {}, "list": [{}, {}]}, "version": 1 }'%json.dumps(rec["digest"])
+        self.write_log(text+"\n")
+        w=VersionedVault(self.root)
+        self.assertEqual(w.get("k"),value)
+    def test_handwritten_non_finite_records_still_load(self):
+        for token,checker in (("NaN",lambda v:math.isnan(v)),
+                              ("Infinity",lambda v:math.isinf(v) and v>0),
+                              ("-Infinity",lambda v:math.isinf(v) and v<0)):
+            body='{"version":1,"name":"k","value":%s}'%token
+            digest=VersionedVault._digest(json.loads(body))
+            self.write_log('{"version":1,"name":"k","value":%s,"digest":%s}\n'%(token,json.dumps(digest)))
+            w=VersionedVault(self.root)
+            self.assertTrue(checker(w.get("k")),token)
+            (self.root/"versions.jsonl").unlink()
+    def test_reload_and_put_keep_snapshot_and_bytes_on_duplicate_tail(self):
+        self.vault.put("a",1)
+        before=self.vault.versions()
+        prefix=self.log_bytes()
+        tail=('{"version":2,"name":"a","value":{"x":1,"x":2},"digest":%s}\n'
+              %json.dumps(self._digest({"x":2},name="a",version=2)))
+        # the tail chains correctly and verifies under plain last-wins parsing
+        parsed=json.loads(tail)
+        self.assertEqual(parsed["version"],2)
+        self.assertEqual(parsed["digest"],self._digest({"x":2},name="a",version=2))
+        self.write_log(prefix.decode()+tail)
+        with self.assertRaisesRegex(ValueError,r"^invalid vault record$"):
+            self.vault.reload()
+        self.assertEqual(self.vault.versions(),before)
+        self.assertEqual(self.vault.active_version("a"),1)
+        with self.assertRaisesRegex(ValueError,r"^invalid vault record$"):
+            self.vault.put("a",2)
+        self.assertEqual(self.vault.versions(),before)
+        self.assertEqual(self.log_bytes(),prefix+tail.encode())
+        with self.assertRaisesRegex(ValueError,r"^invalid vault record$"):
+            VersionedVault(self.root)
+        # removing the ambiguous tail restores continuous chaining
+        self.write_log(prefix.decode())
+        self.assertEqual(self.vault.put("a",3),2)
+        self.assertEqual(VersionedVault(self.root).get("a"),3)
+
 if __name__=='__main__': unittest.main()
