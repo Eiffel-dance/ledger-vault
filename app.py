@@ -1,5 +1,42 @@
-import argparse, copy, fcntl, hashlib, json, math, threading
+import argparse, copy, hashlib, json, math, os, threading, time
 from pathlib import Path
+
+if os.name=="nt":
+    import msvcrt
+else:
+    import fcntl
+
+def _lock_handle(handle,shared=False):
+    # Cross-platform advisory lock on the first byte of the log, standing in
+    # for the whole chain: every writer takes it exclusively and every reader
+    # of the on-disk chain takes it shared, so the revalidate-check-append
+    # sequence is mutually exclusive across threads AND processes on both
+    # Windows and POSIX.  The OS releases the lock if the holder dies, so a
+    # crashed writer can never block later calls permanently.
+    if os.name=="nt":
+        # msvcrt locks the byte range starting at the current file position
+        # and LK_LOCK only retries for about ten seconds, so poll LK_NBLCK
+        # instead: contention is the only expected failure once the handle is
+        # open, and the poll survives holders that keep the lock for as long
+        # as they need.
+        handle.seek(0)
+        while True:
+            try:
+                msvcrt.locking(handle.fileno(),msvcrt.LK_NBLCK,1)
+                return
+            except OSError:
+                time.sleep(0.05)
+    else:
+        fcntl.flock(handle.fileno(),fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+
+def _unlock_handle(handle):
+    if os.name=="nt":
+        # The unlocked range must match the locked one exactly, and ranges are
+        # measured from the current position, so rewind before releasing.
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(),msvcrt.LK_UNLCK,1)
+    else:
+        fcntl.flock(handle.fileno(),fcntl.LOCK_UN)
 
 class VersionConflictError(Exception):
     # Raised by put_if_version when the active version on disk no longer
@@ -113,14 +150,25 @@ class VersionedVault:
         if not isinstance(digest,str) or digest!=self._digest(item):
             raise ValueError("invalid vault record")
         return {"version":version,"name":name,"value":item["value"]}
-    def _load(self):
+    def _load(self,handle=None):
         snapshot,records,by_version={},[],{}
         previous=0
-        if self.log.exists():
+        text=None
+        if handle is not None:
+            # Read through the very handle that holds the lock: on Windows a
+            # byte-range lock also blocks this process's OTHER handles, so a
+            # second open could not even read the locked first byte.
+            handle.seek(0)
+            try:
+                text=handle.read().decode("utf-8")
+            except ValueError:
+                raise ValueError("invalid vault record")
+        elif self.log.exists():
             try:
                 text=self.log.read_text(encoding="utf-8")
             except ValueError:
                 raise ValueError("invalid vault record")
+        if text is not None:
             for line in text.splitlines():
                 item=self._parse_record(line,previous)
                 previous=item["version"]
@@ -132,22 +180,42 @@ class VersionedVault:
         # Build the complete new state first; only replace the snapshot once
         # the whole chain has validated, so readers never see an intermediate
         # state and a corrupt log leaves the previous snapshot untouched.
-        state=self._load()
+        # While the log exists the read runs under a shared lock, so a reload
+        # racing a writer waits for the commit to finish and can only ever
+        # read the complete chain from before or after it, never half a
+        # record or the middle of a batch.  A missing log is the empty chain
+        # and is reported without creating anything.
+        if self.log.exists():
+            handle=self.log.open("rb")
+            try:
+                _lock_handle(handle,shared=True)
+                try:
+                    state=self._load(handle)
+                finally:
+                    _unlock_handle(handle)
+            finally:
+                handle.close()
+        else:
+            state=self._load()
         self._state=state
         return len(state.snapshot)
     def _append_locked(self,name,value,expected_version):
         # Shared body of put and put_if_version.  Every argument has already
         # passed its side-effect-free validation; the in-process lock plus an
-        # exclusive flock serializes the whole revalidate-check-append sequence
-        # so that two conditional writers can never append against the same
-        # base version, as threads or as separate processes.
+        # exclusive cross-platform file lock serializes the whole
+        # revalidate-check-append sequence so that two conditional writers can
+        # never append against the same base version, as threads or as
+        # separate processes, on Windows and POSIX alike.
         with self._write_lock:
             if self.log.exists():
-                # A read-only handle is enough to take the lock (flock contends
-                # on the inode, so this also serializes against writers that
-                # opened the log in append mode) and leaves a conditional miss
-                # free of any filesystem side effect.
-                lock_handle=self.log.open("r",encoding="utf-8"); created=False
+                # One handle carries the lock, the chain read and the append:
+                # on Windows a byte-range lock taken through one handle also
+                # blocks this process's other handles, so touching the log
+                # through a second handle while holding the lock would fail
+                # there.  "a+b" never truncates, forces every write to the end
+                # of the file, and requires the same write permission the
+                # append itself needs.
+                lock_handle=self.log.open("a+b")
             else:
                 # The vault does not exist yet.  Rehearse against the empty
                 # chain BEFORE creating anything, preserving put's rule that an
@@ -157,32 +225,44 @@ class VersionedVault:
                 if expected_version is not None:
                     raise VersionConflictError(name,expected_version,None)
                 self.root.mkdir(parents=True,exist_ok=True)
-                lock_handle=self.log.open("a",encoding="utf-8"); created=True
+                # "a+b" creates the log but never truncates it: if another
+                # process won the creation race, its committed records survive
+                # and are found by the locked revalidation below.
+                lock_handle=self.log.open("a+b")
             try:
-                fcntl.flock(lock_handle.fileno(),fcntl.LOCK_EX)
-                # Revalidate the complete chain from disk under the lock so a
-                # new record is only appended when it attaches to the valid
-                # chain and the caller's base version is still active.  Another
-                # writer may have populated a just-created log before this lock
-                # was taken, so the version is always derived here.
-                state=self._load()
-                if expected_version is not None:
-                    active=state.snapshot.get(name)
-                    actual_version=active["version"] if active is not None else None
-                    if actual_version!=expected_version:
-                        # No bytes written and self._state is left untouched.
-                        raise VersionConflictError(name,expected_version,actual_version)
-                version=len(state.records)+1
-                line=self._build_line(name,value,version)
-                if created:
-                    lock_handle.write(line)
-                else:
-                    with self.log.open("a",encoding="utf-8") as f:
-                        f.write(line)
+                _lock_handle(lock_handle)
+                try:
+                    # Revalidate the complete chain from disk under the lock so
+                    # a new record is only appended when it attaches to the
+                    # valid chain and the caller's base version is still
+                    # active.  Another writer may have populated a just-created
+                    # log before this lock was taken, so the version is always
+                    # derived here.
+                    state=self._load(lock_handle)
+                    if expected_version is not None:
+                        active=state.snapshot.get(name)
+                        actual_version=active["version"] if active is not None else None
+                        if actual_version!=expected_version:
+                            # No bytes written and self._state is left untouched.
+                            raise VersionConflictError(name,expected_version,actual_version)
+                    version=len(state.records)+1
+                    line=self._build_line(name,value,version)
+                    # Binary append of the exact UTF-8 bytes: the record keeps
+                    # its "\n" terminator on every platform instead of picking
+                    # up a text-mode "\r\n" translation on Windows.
+                    lock_handle.seek(0,os.SEEK_END)
+                    lock_handle.write(line.encode("utf-8"))
+                    lock_handle.flush()
+                finally:
+                    # Released on success, ValueError, TypeError,
+                    # VersionConflictError and any I/O error alike, so later
+                    # calls always find the coordination free again.
+                    _unlock_handle(lock_handle)
             finally:
-                # Closing the append handle flushes its bytes before the lock
-                # is released, so any waiter revalidates against a chain that
-                # already includes the new record.
+                # Closing after the flush above guarantees the appended bytes
+                # are on disk before the lock is released, so any waiter
+                # revalidates against a chain that already includes the new
+                # record.
                 lock_handle.close()
             self.reload(); return version
     def _append_batch_locked(self,pairs):
@@ -190,40 +270,40 @@ class VersionedVault:
         # side-effect-free validation (including the _build_line rehearsal), so
         # nothing here can fail with TypeError; a corrupt chain still surfaces
         # as ValueError from the locked revalidation before any byte is written.
-        # The in-process lock plus an exclusive flock serializes the whole
-        # revalidate-append sequence against every other put/put_batch, as
-        # threads or as separate processes, so no record can interleave into
-        # the batch's consecutive version range.
+        # The in-process lock plus an exclusive cross-platform file lock
+        # serializes the whole revalidate-append sequence against every other
+        # put/put_batch, as threads or as separate processes, on Windows and
+        # POSIX alike, so no record can interleave into the batch's
+        # consecutive version range.
         with self._write_lock:
-            if self.log.exists():
-                # Same read-only lock handle as _append_locked: flock contends
-                # on the inode, and a corrupt chain is detected without any
-                # filesystem side effect.
-                lock_handle=self.log.open("r",encoding="utf-8"); created=False
-            else:
+            if not self.log.exists():
                 # Validation already rehearsed every record above, so reaching
-                # this point cannot fail; only now may the directory be created.
+                # this point cannot fail; only now may the directory be
+                # created.  "a+b" creates the log without ever truncating a
+                # log another process committed in the meantime.
                 self.root.mkdir(parents=True,exist_ok=True)
-                lock_handle=self.log.open("a",encoding="utf-8"); created=True
+            lock_handle=self.log.open("a+b")
             try:
-                fcntl.flock(lock_handle.fileno(),fcntl.LOCK_EX)
-                # Revalidate the complete chain from disk under the lock; the
-                # batch's versions are always derived from the chain found here
-                # because another process may have appended before the lock was
-                # taken.  A corrupt chain raises ValueError before any write.
-                state=self._load()
-                base=len(state.records)
-                text="".join(self._build_line(name,value,base+index+1)
-                             for index,(name,value) in enumerate(pairs))
-                if created:
-                    lock_handle.write(text)
-                else:
-                    with self.log.open("a",encoding="utf-8") as f:
-                        f.write(text)
+                _lock_handle(lock_handle)
+                try:
+                    # Revalidate the complete chain from disk under the lock;
+                    # the batch's versions are always derived from the chain
+                    # found here because another process may have appended
+                    # before the lock was taken.  A corrupt chain raises
+                    # ValueError before any write.
+                    state=self._load(lock_handle)
+                    base=len(state.records)
+                    text="".join(self._build_line(name,value,base+index+1)
+                                 for index,(name,value) in enumerate(pairs))
+                    # One binary write publishes the whole batch atomically
+                    # with respect to the lock: waiters can only revalidate
+                    # against the chain from before or after the commit.
+                    lock_handle.seek(0,os.SEEK_END)
+                    lock_handle.write(text.encode("utf-8"))
+                    lock_handle.flush()
+                finally:
+                    _unlock_handle(lock_handle)
             finally:
-                # Closing flushes the bytes before the lock is released, so any
-                # waiter revalidates against a chain that already includes the
-                # whole batch.
                 lock_handle.close()
             self.reload()
             return [base+index+1 for index in range(len(pairs))]
