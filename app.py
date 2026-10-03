@@ -75,16 +75,22 @@ class VersionedVault:
     # rely on the file lock alone.
     _registry_lock=threading.Lock()
     _write_locks={}
-    def __init__(self, root="vault"):
-        self.root=Path(root); self.log=self.root/"versions.jsonl"
-        self._state=_State({},(),{})
-        key=os.path.normcase(os.path.abspath(self.log))
+    @staticmethod
+    def _write_lock_for(log):
+        # One shared in-process lock per log path, used by every instance and
+        # by audit alike so threads of this process serialize on it exactly
+        # the way separate processes serialize on the OS file lock.
+        key=os.path.normcase(os.path.abspath(log))
         with VersionedVault._registry_lock:
             lock=VersionedVault._write_locks.get(key)
             if lock is None:
                 lock=threading.RLock()
                 VersionedVault._write_locks[key]=lock
-        self._write_lock=lock
+        return lock
+    def __init__(self, root="vault"):
+        self.root=Path(root); self.log=self.root/"versions.jsonl"
+        self._state=_State({},(),{})
+        self._write_lock=VersionedVault._write_lock_for(self.log)
         self.reload()
     @staticmethod
     def _digest(item):
@@ -158,38 +164,50 @@ class VersionedVault:
                 raise ValueError("invalid vault record")
             seen.add(key)
         return dict(pairs)
-    def _parse_record(self,line,previous):
+    @staticmethod
+    def _parse_record(line,previous):
         try:
-            item=json.loads(line,object_pairs_hook=self._object_from_pairs)
+            item=json.loads(line,object_pairs_hook=VersionedVault._object_from_pairs)
         except ValueError:
             raise ValueError("invalid vault record")
         if not isinstance(item,dict) or set(item)!={"version","name","value","digest"}:
             raise ValueError("invalid vault record")
         version=item["version"]
-        if not self._is_positive_int(version) or version!=previous+1:
+        if not VersionedVault._is_positive_int(version) or version!=previous+1:
             raise ValueError("invalid vault record")
         name=item["name"]
         if not isinstance(name,str) or not name:
             raise ValueError("invalid vault record")
         digest=item["digest"]
-        if not isinstance(digest,str) or digest!=self._digest(item):
+        if not isinstance(digest,str) or digest!=VersionedVault._digest(item):
             raise ValueError("invalid vault record")
         return {"version":version,"name":name,"value":item["value"]}
-    def _load(self):
+    @staticmethod
+    def _load_log(log):
+        # Full-chain validation of one log path, shared by reload (instance
+        # state rebuild) and audit (one-off read-only verification).  Every
+        # record must chain continuously from version 1, carry a non-empty
+        # string name, hold exactly the four members with unique JSON names at
+        # every depth, and reproduce its digest; any violation — JSON syntax,
+        # duplicate members, field shape, version gap, bad name, digest
+        # mismatch or undecodable text — is ValueError("invalid vault record"),
+        # while underlying I/O failures propagate unchanged.
         snapshot,records,by_version={},[],{}
         previous=0
-        if self.log.exists():
+        if log.exists():
             try:
-                text=self.log.read_text(encoding="utf-8")
+                text=log.read_text(encoding="utf-8")
             except ValueError:
                 raise ValueError("invalid vault record")
             for line in text.splitlines():
-                item=self._parse_record(line,previous)
+                item=VersionedVault._parse_record(line,previous)
                 previous=item["version"]
                 records.append(item)
                 by_version[item["version"]]=item
                 snapshot[item["name"]]={"version":item["version"],"value":item["value"]}
         return _State(snapshot,tuple(records),by_version)
+    def _load(self):
+        return self._load_log(self.log)
     def reload(self):
         # Build the complete new state first; only replace the snapshot once
         # the whole chain has validated, so readers never see an intermediate
@@ -212,6 +230,39 @@ class VersionedVault:
                 state=self._load()
             self._state=state
             return len(state.snapshot)
+    @staticmethod
+    def audit(root="vault"):
+        # Read-only integrity audit of the vault at `root`, for maintenance
+        # and offline acceptance: independently re-read versions.jsonl and
+        # validate the complete chain under the same coordination the writers
+        # and reload use, so a concurrent put/put_batch/reload can only ever
+        # show the complete pre-commit or post-commit chain, never half a
+        # record or the middle of a batch.  Returns exactly three integer
+        # keys — record_count (valid records on disk), active_names (names in
+        # the final state) and last_version (highest global version) — and an
+        # empty root or a missing log audits as three zeros.  Every chain
+        # violation raises ValueError("invalid vault record") and underlying
+        # read failures propagate as the original I/O exceptions.  The audit
+        # never creates a directory or log, never rewrites a byte, never
+        # advances a version number and never touches any instance's snapshot,
+        # so a log corrupted before the audit leaves every loaded state as it
+        # was; the report describes the single complete state captured when
+        # the audit's coordinated read ran.
+        log=Path(root)/"versions.jsonl"
+        with VersionedVault._write_lock_for(log):
+            if log.exists():
+                lock_handle=log.open("rb")
+                try:
+                    with _file_lock(lock_handle):
+                        state=VersionedVault._load_log(log)
+                finally:
+                    lock_handle.close()
+            else:
+                state=VersionedVault._load_log(log)
+        records=state.records
+        return {"record_count":len(records),
+                "active_names":len(state.snapshot),
+                "last_version":records[-1]["version"] if records else 0}
     def _append_locked(self,name,value,expected_version):
         # Shared body of put and put_if_version.  Every argument has already
         # passed its side-effect-free validation; the in-process per-root lock
@@ -459,7 +510,7 @@ class VersionedVault:
         return result
 if __name__=="__main__":
     p=argparse.ArgumentParser(description="VersionedVault command line")
-    p.add_argument("command",choices=("put","get","versions","active","history","snapshot","diff"))
+    p.add_argument("command",choices=("put","get","versions","active","history","snapshot","diff","verify"))
     p.add_argument("--root",default="vault")
     p.add_argument("--name")
     p.add_argument("--value",help="write the argument verbatim as a string; mutually exclusive with --value-json")
@@ -485,6 +536,21 @@ if __name__=="__main__":
                         "without this flag get keeps its default output")
     a=p.parse_args()
     try:
+        if a.command=="verify":
+            # verify accepts --root alone: any name, value, version or output
+            # option takes the same unified failure path as every other
+            # rejected command line (status 1, nothing on stdout), checked
+            # before the audit runs.  The audit itself is read-only — it
+            # appends no record, creates nothing and prints no partial
+            # result; a corrupt vault raises ValueError below and exits 1
+            # with stdout still empty.
+            if (a.name is not None or a.value is not None or a.value_json is not None
+                    or a.version is not None or a.if_version is not None
+                    or a.from_version is not None or a.to_version is not None
+                    or a.json_output):
+                raise SystemExit(1)
+            print(json.dumps(VersionedVault.audit(a.root),ensure_ascii=False,sort_keys=True))
+            raise SystemExit(0)
         v=VersionedVault(a.root)
         if a.command=="put":
             # Checked by hand instead of an argparse mutually-exclusive group so
