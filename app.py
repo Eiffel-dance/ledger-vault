@@ -78,14 +78,19 @@ class VersionedVault:
     def __init__(self, root="vault"):
         self.root=Path(root); self.log=self.root/"versions.jsonl"
         self._state=_State({},(),{})
-        key=os.path.normcase(os.path.abspath(self.log))
+        self._write_lock=self._lock_for_log(self.log)
+        self.reload()
+    @staticmethod
+    def _lock_for_log(log):
+        # The process-wide per-log coordination lock shared by every instance
+        # (and by the instance-free audit entry) for the same root.
+        key=os.path.normcase(os.path.abspath(log))
         with VersionedVault._registry_lock:
             lock=VersionedVault._write_locks.get(key)
             if lock is None:
                 lock=threading.RLock()
                 VersionedVault._write_locks[key]=lock
-        self._write_lock=lock
-        self.reload()
+        return lock
     @staticmethod
     def _digest(item):
         body={k:item[k] for k in ("version","name","value")}
@@ -158,33 +163,39 @@ class VersionedVault:
                 raise ValueError("invalid vault record")
             seen.add(key)
         return dict(pairs)
-    def _parse_record(self,line,previous):
+    @staticmethod
+    def _parse_record(line,previous):
         try:
-            item=json.loads(line,object_pairs_hook=self._object_from_pairs)
+            item=json.loads(line,object_pairs_hook=VersionedVault._object_from_pairs)
         except ValueError:
             raise ValueError("invalid vault record")
         if not isinstance(item,dict) or set(item)!={"version","name","value","digest"}:
             raise ValueError("invalid vault record")
         version=item["version"]
-        if not self._is_positive_int(version) or version!=previous+1:
+        if not VersionedVault._is_positive_int(version) or version!=previous+1:
             raise ValueError("invalid vault record")
         name=item["name"]
         if not isinstance(name,str) or not name:
             raise ValueError("invalid vault record")
         digest=item["digest"]
-        if not isinstance(digest,str) or digest!=self._digest(item):
+        if not isinstance(digest,str) or digest!=VersionedVault._digest(item):
             raise ValueError("invalid vault record")
         return {"version":version,"name":name,"value":item["value"]}
-    def _load(self):
+    @staticmethod
+    def _load_log(log):
+        # Pure, side-effect-free read of one complete chain using the exact
+        # record format, chaining and digest rules every loader shares.  A
+        # missing or empty log is the empty vault; a log that fails UTF-8
+        # decoding is as corrupt as a record that fails validation.
         snapshot,records,by_version={},[],{}
         previous=0
-        if self.log.exists():
+        if log.exists():
             try:
-                text=self.log.read_text(encoding="utf-8")
+                text=log.read_text(encoding="utf-8")
             except ValueError:
                 raise ValueError("invalid vault record")
             for line in text.splitlines():
-                item=self._parse_record(line,previous)
+                item=VersionedVault._parse_record(line,previous)
                 previous=item["version"]
                 records.append(item)
                 by_version[item["version"]]=item
@@ -205,13 +216,46 @@ class VersionedVault:
                 lock_handle=self.log.open("rb")
                 try:
                     with _file_lock(lock_handle):
-                        state=self._load()
+                        state=self._load_log(self.log)
                 finally:
                     lock_handle.close()
             else:
-                state=self._load()
+                state=self._load_log(self.log)
             self._state=state
             return len(state.snapshot)
+    @classmethod
+    def audit(cls,root="vault"):
+        # Read-only, instance-free integrity audit for maintenance and offline
+        # acceptance.  Independently reads versions.jsonl under the same
+        # coordination as writers and reload — the shared per-root lock plus
+        # the cross-platform file lock — so it always observes one complete
+        # pre-commit or post-commit chain, never a torn record or a half-written
+        # batch.  Nothing is created, repaired, versioned or snapshotted: no
+        # directory, no log, no bytes and no instance state change, and a log
+        # already corrupt on disk merely raises without touching anything.  The
+        # result reports the single complete state captured when the audit
+        # began: the number of valid records, the number of names in the final
+        # state, and the highest global version (all zero for an absent root or
+        # an empty log).  Any malformed record — JSON syntax error, duplicated
+        # member, wrong field set, broken version continuity, illegal name,
+        # mismatched digest or failed text decoding — is reported as
+        # ValueError("invalid vault record"); underlying read failures surface
+        # as the existing I/O exceptions.
+        log=Path(root)/"versions.jsonl"
+        with cls._lock_for_log(log):
+            if not log.exists():
+                return {"record_count":0,"active_names":0,"last_version":0}
+            lock_handle=log.open("rb")
+            try:
+                with _file_lock(lock_handle):
+                    state=cls._load_log(log)
+            finally:
+                lock_handle.close()
+        records=state.records
+        last=records[-1]["version"] if records else 0
+        return {"record_count":len(records),
+                "active_names":len(state.snapshot),
+                "last_version":last}
     def _append_locked(self,name,value,expected_version):
         # Shared body of put and put_if_version.  Every argument has already
         # passed its side-effect-free validation; the in-process per-root lock
@@ -244,7 +288,7 @@ class VersionedVault:
                     # active.  Another writer may have populated a just-created
                     # log before this lock was taken, so the version is always
                     # derived here.
-                    state=self._load()
+                    state=self._load_log(self.log)
                     if expected_version is not None:
                         active=state.snapshot.get(name)
                         actual_version=active["version"] if active is not None else None
@@ -291,7 +335,7 @@ class VersionedVault:
                     # found here because another process may have appended
                     # before the lock was taken.  A corrupt chain raises
                     # ValueError before any write.
-                    state=self._load()
+                    state=self._load_log(self.log)
                     base=len(state.records)
                     text="".join(self._build_line(name,value,base+index+1)
                                  for index,(name,value) in enumerate(pairs))
@@ -459,7 +503,7 @@ class VersionedVault:
         return result
 if __name__=="__main__":
     p=argparse.ArgumentParser(description="VersionedVault command line")
-    p.add_argument("command",choices=("put","get","versions","active","history","snapshot","diff"))
+    p.add_argument("command",choices=("put","get","versions","active","history","snapshot","diff","verify"))
     p.add_argument("--root",default="vault")
     p.add_argument("--name")
     p.add_argument("--value",help="write the argument verbatim as a string; mutually exclusive with --value-json")
@@ -485,6 +529,21 @@ if __name__=="__main__":
                         "without this flag get keeps its default output")
     a=p.parse_args()
     try:
+        if a.command=="verify":
+            # verify is the read-only audit front end: it takes --root and
+            # nothing else.  Any of the other commands' options is rejected the
+            # same way every other semantic option failure is (status 1,
+            # nothing on stdout), before the audit reads anything.  The audit
+            # itself never prints a partial result: its single object is
+            # serialized only after the whole chain validates, and a corrupt
+            # log's ValueError takes the shared failure path below.
+            if (a.name is not None or a.value is not None or a.value_json is not None
+                    or a.version is not None or a.if_version is not None
+                    or a.from_version is not None or a.to_version is not None
+                    or a.json_output):
+                raise SystemExit(1)
+            print(json.dumps(VersionedVault.audit(a.root),sort_keys=True))
+            raise SystemExit(0)
         v=VersionedVault(a.root)
         if a.command=="put":
             # Checked by hand instead of an argparse mutually-exclusive group so

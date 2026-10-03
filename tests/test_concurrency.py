@@ -273,6 +273,64 @@ class ReaderConsistencyTest(ConcurrencyCase):
         self.assertEqual(reader.reload(),80)
         self.assertEqual([r["version"] for r in reader.history()],list(range(1,81)))
 
+class AuditConsistencyTest(ConcurrencyCase):
+    def test_audit_only_reads_complete_commits_in_process(self):
+        writer=VersionedVault(self.root)
+        done=threading.Event()
+        errors=[]
+        def write():
+            for round_ in range(15):
+                writer.put_batch([["w-%d-%d"%(round_,i),"x"*1500] for i in range(10)])
+        def read():
+            while not done.is_set():
+                try:
+                    report=VersionedVault.audit(self.root)
+                except Exception as exc:
+                    errors.append(exc)
+                    return
+                # Every report describes one complete chain: the highest
+                # version equals the record count and is a multiple of the
+                # batch size seen so far — never a mid-batch ordinal.
+                if (report["record_count"]!=report["last_version"]
+                        or report["last_version"]%10!=0):
+                    errors.append(AssertionError("torn chain: %r"%report))
+                    return
+        reader_thread=threading.Thread(target=read)
+        writer_thread=threading.Thread(target=write)
+        reader_thread.start(); writer_thread.start()
+        writer_thread.join(180)
+        self.assertFalse(writer_thread.is_alive())
+        done.set(); reader_thread.join(180)
+        self.assertEqual(errors,[])
+        self.assertEqual(VersionedVault.audit(self.root),
+                         {"record_count":150,"active_names":150,"last_version":150})
+
+    def test_verify_during_cross_process_writes_never_reports_torn_chain(self):
+        proc=subprocess.Popen([sys.executable,str(WORKER),"batch",str(self.root),"8","10","pw"],
+                              stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        errors=[]
+        while proc.poll() is None:
+            r=subprocess.run([sys.executable,str(APP),"--root",str(self.root),"verify"],
+                             capture_output=True,text=True,timeout=60)
+            if r.returncode==0:
+                report=json.loads(r.stdout)
+                if report["record_count"]!=report["last_version"] or report["last_version"]%10!=0:
+                    errors.append("torn chain: %r"%report)
+                    break
+            else:
+                # A status 1 here would mean the audit saw a torn record —
+                # the coordination must make that impossible.
+                errors.append("unexpected status %d: %s"%(r.returncode,r.stderr))
+                break
+        out,err=proc.communicate(timeout=180)
+        self.assertEqual(proc.returncode,0,err)
+        self.assertEqual(errors,[])
+        r=subprocess.run([sys.executable,str(APP),"--root",str(self.root),"verify"],
+                         capture_output=True,text=True,timeout=60)
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertEqual(json.loads(r.stdout),
+                         {"record_count":80,"active_names":80,"last_version":80})
+
 class WindowsBranchSimulationTest(ConcurrencyCase):
     # The msvcrt branch of the lock helpers normally only executes on
     # Windows.  Loading app.py under a fake os.name=="nt" with a fake msvcrt
@@ -364,6 +422,40 @@ class CommandLineRegressionTest(ConcurrencyCase):
                                   "--value-json","{}").returncode,1)
         self.assertEqual(self.cli("snapshot","--version","-1").returncode,1)
         self.assertEqual(self.cli("diff","--from-version","2").returncode,1)
+
+    def test_verify_outputs_one_ordered_line_and_empty_cases(self):
+        fresh=Path(self._tmp.name)/"fresh"
+        r=subprocess.run([sys.executable,str(APP),"--root",str(fresh),"verify"],
+                         capture_output=True,text=True,timeout=60)
+        self.assertEqual((r.returncode,r.stdout),
+                         (0,'{"active_names": 0, "last_version": 0, "record_count": 0}\n'),r.stderr)
+        self.assertEqual(json.loads(r.stdout),
+                         {"record_count":0,"active_names":0,"last_version":0})
+        self.assertFalse(fresh.exists())
+        # a populated, intact root reports its single complete state
+        vault=VersionedVault(self.root)
+        vault.put("a",1); vault.put("b",2); vault.put("a",3)
+        r=self.cli("verify")
+        self.assertEqual((r.returncode,r.stdout),
+                         (0,'{"active_names": 2, "last_version": 3, "record_count": 3}\n'))
+        # only --root is accepted: any other option fails like existing
+        # option-semantics failures (status 1, empty stdout), and an unknown
+        # subcommand keeps argparse's status 2
+        for extra in (("--name","a"),("--value","x"),("--version","1"),("--json",),
+                      ("--if-version","1"),("--from-version","0","--to-version","1"),
+                      ("--value-json","1")):
+            r=self.cli("verify",*extra)
+            self.assertEqual((r.returncode,r.stdout),(1,""),extra)
+
+    def test_verify_corrupt_log_exits_1_without_output_or_writes(self):
+        vault=VersionedVault(self.root)
+        vault.put("a",1)
+        before=self.log.read_bytes()
+        with self.log.open("a",encoding="utf-8") as f:
+            f.write("not-json\n")
+        r=self.cli("verify")
+        self.assertEqual((r.returncode,r.stdout),(1,""))
+        self.assertEqual(self.log.read_bytes(),before+b"not-json\n")
         # a corrupt log fails every command with status 1 and no partial output
         with self.log.open("a",encoding="utf-8") as f:
             f.write("not-json\n")

@@ -279,4 +279,80 @@ class PutBatchTest(_VaultCase):
         self.write_log(good.decode())
         self.assertEqual(self.vault.put_batch([["b",2],["c",3]]),[2,3])
 
+class AuditTest(_VaultCase):
+    def audit(self):
+        # The entry is instance-free and accepts an existing root path.
+        return VersionedVault.audit(self.root)
+    def assert_zeros(self,result):
+        self.assertEqual(result,{"record_count":0,"active_names":0,"last_version":0})
+        self.assertEqual(set(result),{"record_count","active_names","last_version"})
+        self.assertTrue(all(isinstance(v,int) and not isinstance(v,bool) for v in result.values()))
+    def test_missing_root_and_empty_log_report_zeroes_without_creating_anything(self):
+        target=Path(self._tmp.name)/"never-created"
+        self.assertFalse(target.exists())
+        self.assert_zeros(VersionedVault.audit(target))
+        # A read-only audit creates neither the directory nor the log.
+        self.assertFalse(target.exists())
+        self.assertFalse((target/"versions.jsonl").exists())
+        self.root.mkdir(parents=True)
+        self.assert_zeros(self.audit())
+        (self.root/"versions.jsonl").write_bytes(b"")
+        self.assert_zeros(self.audit())
+    def test_counts_records_names_and_highest_version(self):
+        self.vault.put("a",1); self.vault.put("b",2); self.vault.put("a",3)
+        result=self.audit()
+        self.assertEqual(result,{"record_count":3,"active_names":2,"last_version":3})
+        self.assertEqual(set(result),{"record_count","active_names","last_version"})
+        self.assertTrue(all(isinstance(v,int) and not isinstance(v,bool) for v in result.values()))
+        # also callable through an instance, and on a second independent root
+        self.assertEqual(self.vault.audit(self.root)["last_version"],3)
+        VersionedVault(Path(self._tmp.name)/"other").put("only",[1])
+        self.assertEqual(VersionedVault.audit(Path(self._tmp.name)/"other"),
+                         {"record_count":1,"active_names":1,"last_version":1})
+    def test_every_corruption_kind_is_the_same_value_error(self):
+        def digest(value,name="k",version=1):
+            return VersionedVault._digest({"version":version,"name":name,"value":value})
+        good={"version":1,"name":"k","value":1}
+        good["digest"]=VersionedVault._digest(good)
+        corrupt_texts=[
+            "not-json\n",
+            '{"version":1,"name":"k","value":1,"value":1,"digest":%s}\n'%json.dumps(digest(1)),
+            '{"version":1,"name":"k","value":{"a":1,"a":2},"digest":%s}\n'%json.dumps(digest({"a":2})),
+            json.dumps({"version":1,"name":"k","value":1})+"\n",
+            json.dumps({"version":1,"name":"k","value":1,"digest":"x","extra":2},sort_keys=True)+"\n",
+            json.dumps({"version":2,"name":"k","value":1,
+                        "digest":VersionedVault._digest({"version":2,"name":"k","value":1})},
+                       sort_keys=True)+"\n",
+            json.dumps({"version":1,"name":"","value":1,
+                        "digest":VersionedVault._digest({"version":1,"name":"","value":1})},
+                       sort_keys=True)+"\n",
+            json.dumps({"version":1,"name":"k","value":1,"digest":"0"*64},sort_keys=True)+"\n",
+        ]
+        for text in corrupt_texts:
+            self.write_log(text)
+            with self.assertRaisesRegex(ValueError,r"^invalid vault record$",msg=text):
+                self.audit()
+        # bytes that are not valid UTF-8 are a decoding failure, not an I/O case
+        self.write_log("placeholder")
+        (self.root/"versions.jsonl").write_bytes(b"\xff\xfe\n")
+        with self.assertRaisesRegex(ValueError,r"^invalid vault record$"):
+            self.audit()
+    def test_audit_is_read_only_and_keeps_existing_snapshot_and_bytes(self):
+        self.vault.put("a",1); self.vault.put("a",2)
+        before=self.vault.versions()
+        good_bytes=self.log_bytes()
+        self.write_log(good_bytes.decode()+"not-json\n")
+        # the audit raises, changes nothing, and never touches the instance
+        with self.assertRaises(ValueError): self.audit()
+        self.assertEqual(self.log_bytes(),good_bytes+b"not-json\n")
+        self.assertEqual(self.vault.versions(),before)
+        self.assertEqual(self.vault.active_version("a"),2)
+        # a successful audit is equally side-effect free
+        self.write_log(good_bytes.decode())
+        self.assertEqual(self.audit(),
+                         {"record_count":2,"active_names":1,"last_version":2})
+        self.assertEqual(self.log_bytes(),good_bytes)
+        self.assertEqual(self.vault.versions(),before)
+        self.assertEqual(self.vault.put("a",3),3)
+
 if __name__=='__main__': unittest.main()
