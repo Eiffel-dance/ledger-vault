@@ -492,4 +492,132 @@ class AuditTest(_VaultCase):
         self.assertEqual(self.vault.versions(),before)
         self.assertEqual(self.vault.put("a",3),3)
 
+class ReadViewTest(_VaultCase):
+    def populate(self):
+        self.vault.put("a",{"x":1})
+        self.vault.put("b",[1,2])
+        self.vault.put("a",2)
+    def test_view_matches_vault_reads_at_capture_time(self):
+        self.populate()
+        view=self.vault.read_view()
+        self.assertEqual(view.versions(),self.vault.versions())
+        self.assertEqual(view.history(),self.vault.history())
+        self.assertEqual(view.history("a"),self.vault.history("a"))
+        self.assertEqual(view.get("a"),2)
+        self.assertEqual(view.get("a",version=1),{"x":1})
+        self.assertEqual(view.active_version("a"),3)
+        self.assertEqual(view.snapshot_at(),self.vault.snapshot_at())
+        self.assertEqual(view.snapshot_at(1),self.vault.snapshot_at(1))
+        self.assertEqual(view.diff_at(0,3),self.vault.diff_at(0,3))
+        self.assertEqual(view.diff_at(1,2),self.vault.diff_at(1,2))
+    def test_view_is_frozen_across_writes_reload_and_external_corruption(self):
+        self.populate()
+        view=self.vault.read_view()
+        frozen=(view.versions(),view.history(),view.snapshot_at(2),view.diff_at(0,3))
+        # every write path, a reload, and another instance moving the log
+        self.vault.put("c",9)
+        self.vault.put_batch([["d",1],["a",5]])
+        self.vault.put_if_version("a",6,7)
+        self.vault.put_batch_if_versions([["e",1]],{"e":0})
+        other=VersionedVault(self.root)
+        other.put("f",1)
+        self.vault.reload()
+        self.assertEqual((view.versions(),view.history(),view.snapshot_at(2),view.diff_at(0,3)),
+                         frozen)
+        self.assertEqual(view.active_version("a"),3)
+        self.assertEqual(view.get("a"),2)
+        with self.assertRaises(KeyError): view.get("c")
+        with self.assertRaises(KeyError): view.active_version("f")
+        # the view's record total stays the captured one
+        with self.assertRaises(ValueError): view.snapshot_at(4)
+        with self.assertRaises(ValueError): view.diff_at(0,4)
+        # external corruption of the log cannot reach the captured view
+        self.write_log(self.log_bytes().decode()+"not-json\n")
+        with self.assertRaises(ValueError): self.vault.reload()
+        self.assertEqual((view.versions(),view.history(),view.snapshot_at(2),view.diff_at(0,3)),
+                         frozen)
+    def test_view_does_not_reload_or_touch_disk(self):
+        self.populate()
+        before_bytes=self.log_bytes()
+        # log moved on disk after the instance loaded: read_view must not
+        # re-read it, and must not create or modify anything
+        self.write_log(before_bytes.decode()+'{"broken":true}\n')
+        view=self.vault.read_view()
+        self.assertEqual(view.get("a"),2)
+        self.assertEqual(self.log_bytes(),before_bytes+b'{"broken":true}\n')
+        self.assertEqual(self.vault.active_version("a"),3)
+    def test_view_on_empty_vault(self):
+        target=Path(self._tmp.name)/"empty_view"
+        w=VersionedVault(target)
+        view=w.read_view()
+        self.assertEqual(view.versions(),[])
+        self.assertEqual(view.history(),[])
+        self.assertEqual(view.history("nope"),[])
+        self.assertEqual(view.snapshot_at(),[])
+        self.assertEqual(view.snapshot_at(0),[])
+        self.assertEqual(view.diff_at(0,0),[])
+        with self.assertRaises(KeyError): view.get("nope")
+        with self.assertRaises(KeyError): view.active_version("nope")
+        with self.assertRaises(ValueError): view.snapshot_at(1)
+        with self.assertRaises(ValueError): view.diff_at(0,1)
+        # read_view created nothing on disk
+        self.assertFalse(target.exists())
+    def test_view_error_conditions_match_vault_rules(self):
+        self.populate()
+        view=self.vault.read_view()
+        for bad in (0,-1,True,False,1.0,"1"):
+            with self.assertRaises(ValueError,msg=repr(bad)):
+                view.get("a",version=bad)
+        with self.assertRaises(KeyError): view.get("a",version=2)
+        with self.assertRaises(KeyError): view.get("missing")
+        for bad in (-1,True,1.5,"0"):
+            with self.assertRaises(ValueError,msg=repr(bad)):
+                view.snapshot_at(bad)
+        with self.assertRaises(ValueError): view.snapshot_at(4)
+        with self.assertRaises(ValueError): view.diff_at(2,1)
+        with self.assertRaises(ValueError): view.diff_at(-1,2)
+        with self.assertRaises(ValueError): view.diff_at(True,2)
+        with self.assertRaises(ValueError): view.diff_at(0,4)
+        # a failed call produces no partial result and the view still works
+        self.assertEqual(view.get("a"),2)
+    def test_view_returns_deep_copies(self):
+        self.vault.put("k",{"nested":[1,2]})
+        view=self.vault.read_view()
+        got=view.get("k"); got["nested"].append(3)
+        self.assertEqual(view.get("k"),{"nested":[1,2]})
+        view.history()[0]["value"]["nested"].append(3)
+        view.versions()[0]["value"]["nested"].append(3)
+        view.snapshot_at()[0]["value"]["nested"].append(3)
+        view.diff_at(0,1)[0]["to"]["value"]["nested"].append(3)
+        self.assertEqual(view.get("k"),{"nested":[1,2]})
+        # mutating a vault read result cannot reach the view either
+        self.vault.get("k")["nested"].append(3)
+        self.assertEqual(view.get("k"),{"nested":[1,2]})
+    def test_view_exposes_no_write_or_reload_operations(self):
+        view=self.vault.read_view()
+        for name in ("put","put_batch","put_if_version","put_batch_if_versions",
+                     "reload","audit","read_view"):
+            self.assertFalse(hasattr(view,name),name)
+    def test_view_survives_instance_destruction(self):
+        self.populate()
+        view=self.vault.read_view()
+        expected=view.versions()
+        del self.vault
+        import gc; gc.collect()
+        self.assertEqual(view.versions(),expected)
+        self.assertEqual(view.get("a"),2)
+        self.assertEqual(view.diff_at(0,3),
+                         [{"name":"a","from":None,"to":{"version":3,"value":2}},
+                          {"name":"b","from":None,"to":{"version":2,"value":[1,2]}}])
+    def test_view_reads_are_consistent_within_one_view(self):
+        # every method of one view describes the same captured record sequence
+        self.populate()
+        view=self.vault.read_view()
+        self.assertEqual([r["version"] for r in view.history()],[1,2,3])
+        self.assertEqual([r["name"] for r in view.versions()],["a","b"])
+        self.assertEqual(view.snapshot_at(0),[])
+        self.assertEqual(view.snapshot_at(3),view.versions())
+        self.assertEqual(view.diff_at(3,3),[])
+        self.assertEqual(view.diff_at(0,0),[])
+
 if __name__=='__main__': unittest.main()

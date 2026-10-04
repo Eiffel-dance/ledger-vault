@@ -66,7 +66,124 @@ class _State:
     def __init__(self,snapshot,records,by_version):
         self.snapshot=snapshot; self.records=records; self.by_version=by_version
 
-class VersionedVault:
+class _StateReader:
+    # Read-only surface shared by VersionedVault and the consistent view
+    # returned by read_view().  Every method works purely from self._state:
+    # a _State captured once and never mutated after publication, so a caller
+    # only ever observes one complete pre- or post-commit state, never a mix.
+    # Nothing here touches disk, the active version or the next version
+    # number, and every returned value is a fresh deep copy.
+    @staticmethod
+    def _is_positive_int(value):
+        return isinstance(value,int) and not isinstance(value,bool) and value>0
+    @staticmethod
+    def _is_nonneg_int(value):
+        return isinstance(value,int) and not isinstance(value,bool) and value>=0
+    @staticmethod
+    def _json_equal(left,right):
+        # Structural equality under this vault's JSON semantics: identical
+        # container types and scalar values, treating NaN as equal to NaN so
+        # an accepted non-finite float still verifies after a reload.  A tuple
+        # never equals the list it would reload as, so such a value is rejected.
+        if type(left) is not type(right):
+            return False
+        if isinstance(left,float) and math.isnan(left) and math.isnan(right):
+            return True
+        if isinstance(left,dict):
+            return left.keys()==right.keys() and all(
+                _StateReader._json_equal(left[k],right[k]) for k in left)
+        if isinstance(left,list):
+            return len(left)==len(right) and all(
+                _StateReader._json_equal(x,y) for x,y in zip(left,right))
+        return left==right
+    def get(self,name,version=None):
+        state=self._state
+        if version is None:
+            return copy.deepcopy(state.snapshot[name]["value"])
+        if not self._is_positive_int(version):
+            raise ValueError("version must be a positive integer")
+        record=state.by_version.get(version)
+        if record is not None and record["name"]==name:
+            return copy.deepcopy(record["value"])
+        raise KeyError((name,version))
+    def active_version(self,name):
+        return self._state.snapshot[name]["version"]
+    def history(self,name=None):
+        records=self._state.records
+        if name is not None:
+            records=(r for r in records if r["name"]==name)
+        return [{"version":r["version"],"name":r["name"],"value":copy.deepcopy(r["value"])} for r in records]
+    def versions(self):
+        return [{"name":k,"version":v["version"],"value":copy.deepcopy(v["value"])}
+                for k,v in sorted(self._state.snapshot.items())]
+    def snapshot_at(self,version=None):
+        # Read-only whole-repository view as of the first `version` global
+        # records: 0 is an empty snapshot, omitting the point (or passing the
+        # latest number) reproduces the currently loaded state.  The published
+        # _State is captured once and never mutated after publication, so a
+        # concurrent reload can only expose the complete old or new state,
+        # never a mix.  Nothing here touches disk, the active version or the
+        # log, and every returned value is a fresh deep copy.
+        state=self._state
+        if version is None:
+            records=state.records
+        else:
+            if not isinstance(version,int) or isinstance(version,bool) or version<0:
+                raise ValueError("version must be a non-negative integer")
+            total=len(state.records)
+            if version>total:
+                raise ValueError("version must not exceed the number of loaded records")
+            records=state.records[:version]
+        snapshot={}
+        for r in records:
+            snapshot[r["name"]]={"version":r["version"],"value":r["value"]}
+        return [{"name":k,"version":v["version"],"value":copy.deepcopy(v["value"])}
+                for k,v in sorted(snapshot.items())]
+    def diff_at(self,from_version,to_version):
+        # Deterministic difference between two whole-repository points located
+        # by global record ordinal (0 = empty snapshot).  Both bounds must be
+        # non-negative ints (booleans rejected), from must not exceed to, and
+        # neither may exceed the number of loaded records; every violation is a
+        # ValueError raised before any result is built, leaving memory, disk and
+        # the next version number untouched.  The published _State is captured
+        # once here and never mutated after publication, so a concurrent reload
+        # or even external log corruption can only leave this call working from
+        # the complete old state, never a mix, and nothing touches disk.
+        if not self._is_nonneg_int(from_version):
+            raise ValueError("from_version must be a non-negative integer")
+        if not self._is_nonneg_int(to_version):
+            raise ValueError("to_version must be a non-negative integer")
+        if from_version>to_version:
+            raise ValueError("from_version must not exceed to_version")
+        state=self._state
+        total=len(state.records)
+        if to_version>total:
+            raise ValueError("version must not exceed the number of loaded records")
+        def point_snapshot(point):
+            snapshot={}
+            for r in state.records[:point]:
+                snapshot[r["name"]]={"version":r["version"],"value":r["value"]}
+            return snapshot
+        left=point_snapshot(from_version)
+        right=point_snapshot(to_version)
+        # Unicode codepoint (dictionary) order of the config names.  A name is
+        # included only when its active entry differs: a missing side is a real
+        # difference, and rewriting an equal value at a new version is one too.
+        result=[]
+        for name in sorted(set(left)|set(right)):
+            a=left.get(name); b=right.get(name)
+            if (a is not None and b is not None
+                    and a["version"]==b["version"]
+                    and self._json_equal(a["value"],b["value"])):
+                continue
+            result.append({
+                "name":name,
+                "from":None if a is None else {"version":a["version"],"value":copy.deepcopy(a["value"])},
+                "to":None if b is None else {"version":b["version"],"value":copy.deepcopy(b["value"])},
+            })
+        return result
+
+class VersionedVault(_StateReader):
     # In-process users of the same root are serialized through one lock per
     # log file, shared by every instance of this process: on some local
     # filesystems the OS file lock only arbitrates between processes, and a
@@ -95,9 +212,6 @@ class VersionedVault:
     def _digest(item):
         body={k:item[k] for k in ("version","name","value")}
         return hashlib.sha256(json.dumps(body,sort_keys=True,separators=(",",":")).encode()).hexdigest()
-    @staticmethod
-    def _is_positive_int(value):
-        return isinstance(value,int) and not isinstance(value,bool) and value>0
     @staticmethod
     def _ensure_storable(value):
         # A value is only accepted if it can round-trip through the on-disk
@@ -131,23 +245,6 @@ class VersionedVault:
                 # Tuples share JSON array semantics with lists and reload as
                 # lists; descend either way so nested keys are checked too.
                 stack.extend(node)
-    @staticmethod
-    def _json_equal(left,right):
-        # Structural equality under this vault's JSON semantics: identical
-        # container types and scalar values, treating NaN as equal to NaN so
-        # an accepted non-finite float still verifies after a reload.  A tuple
-        # never equals the list it would reload as, so such a value is rejected.
-        if type(left) is not type(right):
-            return False
-        if isinstance(left,float) and math.isnan(left) and math.isnan(right):
-            return True
-        if isinstance(left,dict):
-            return left.keys()==right.keys() and all(
-                VersionedVault._json_equal(left[k],right[k]) for k in left)
-        if isinstance(left,list):
-            return len(left)==len(right) and all(
-                VersionedVault._json_equal(x,y) for x,y in zip(left,right))
-        return left==right
     @staticmethod
     def _object_from_pairs(pairs):
         # object_pairs_hook fires for every JSON object at every depth,
@@ -490,95 +587,30 @@ class VersionedVault:
         # Same round-trip gate as put, run before any filesystem access.
         self._ensure_storable(value)
         return self._append_locked(name,value,expected_version)
-    def get(self,name,version=None):
-        state=self._state
-        if version is None:
-            return copy.deepcopy(state.snapshot[name]["value"])
-        if not self._is_positive_int(version):
-            raise ValueError("version must be a positive integer")
-        record=state.by_version.get(version)
-        if record is not None and record["name"]==name:
-            return copy.deepcopy(record["value"])
-        raise KeyError((name,version))
-    def active_version(self,name):
-        return self._state.snapshot[name]["version"]
-    def history(self,name=None):
-        records=self._state.records
-        if name is not None:
-            records=(r for r in records if r["name"]==name)
-        return [{"version":r["version"],"name":r["name"],"value":copy.deepcopy(r["value"])} for r in records]
-    def versions(self):
-        return [{"name":k,"version":v["version"],"value":copy.deepcopy(v["value"])}
-                for k,v in sorted(self._state.snapshot.items())]
-    def snapshot_at(self,version=None):
-        # Read-only whole-repository view as of the first `version` global
-        # records: 0 is an empty snapshot, omitting the point (or passing the
-        # latest number) reproduces the currently loaded state.  The published
-        # _State is captured once and never mutated after publication, so a
-        # concurrent reload can only expose the complete old or new state,
-        # never a mix.  Nothing here touches disk, the active version or the
-        # log, and every returned value is a fresh deep copy.
-        state=self._state
-        if version is None:
-            records=state.records
-        else:
-            if not isinstance(version,int) or isinstance(version,bool) or version<0:
-                raise ValueError("version must be a non-negative integer")
-            total=len(state.records)
-            if version>total:
-                raise ValueError("version must not exceed the number of loaded records")
-            records=state.records[:version]
-        snapshot={}
-        for r in records:
-            snapshot[r["name"]]={"version":r["version"],"value":r["value"]}
-        return [{"name":k,"version":v["version"],"value":copy.deepcopy(v["value"])}
-                for k,v in sorted(snapshot.items())]
-    @staticmethod
-    def _is_nonneg_int(value):
-        return isinstance(value,int) and not isinstance(value,bool) and value>=0
-    def diff_at(self,from_version,to_version):
-        # Deterministic difference between two whole-repository points located
-        # by global record ordinal (0 = empty snapshot).  Both bounds must be
-        # non-negative ints (booleans rejected), from must not exceed to, and
-        # neither may exceed the number of loaded records; every violation is a
-        # ValueError raised before any result is built, leaving memory, disk and
-        # the next version number untouched.  The published _State is captured
-        # once here and never mutated after publication, so a concurrent reload
-        # or even external log corruption can only leave this call working from
-        # the complete old state, never a mix, and nothing touches disk.
-        if not self._is_nonneg_int(from_version):
-            raise ValueError("from_version must be a non-negative integer")
-        if not self._is_nonneg_int(to_version):
-            raise ValueError("to_version must be a non-negative integer")
-        if from_version>to_version:
-            raise ValueError("from_version must not exceed to_version")
-        state=self._state
-        total=len(state.records)
-        if to_version>total:
-            raise ValueError("version must not exceed the number of loaded records")
-        def point_snapshot(point):
-            snapshot={}
-            for r in state.records[:point]:
-                snapshot[r["name"]]={"version":r["version"],"value":r["value"]}
-            return snapshot
-        left=point_snapshot(from_version)
-        right=point_snapshot(to_version)
-        # Unicode codepoint (dictionary) order of the config names.  A name is
-        # included only when its active entry differs: a missing side is a real
-        # difference, and rewriting an equal value at a new version is one too.
-        result=[]
-        for name in sorted(set(left)|set(right)):
-            a=left.get(name); b=right.get(name)
-            if (a is not None and b is not None
-                    and a["version"]==b["version"]
-                    and self._json_equal(a["value"],b["value"])):
-                continue
-            result.append({
-                "name":name,
-                "from":None if a is None else {"version":a["version"],"value":copy.deepcopy(a["value"])},
-                "to":None if b is None else {"version":b["version"],"value":copy.deepcopy(b["value"])},
-            })
-        return result
+    def read_view(self):
+        # Capture the currently loaded, fully validated in-memory state as a
+        # read-only consistent view.  This only reads the already published
+        # _State reference: no disk access, no reload, and no change to the
+        # active version, the next version number or any existing snapshot.
+        # The _State itself is never mutated after publication, so the view
+        # keeps returning the captured state even when this instance (or
+        # another instance, thread or process) later appends, reloads or is
+        # destroyed, and even if the log on disk is corrupted afterwards.
+        return VaultView(self._state)
+
+class VaultView(_StateReader):
+    # The read-only consistent view created by VersionedVault.read_view().
+    # It holds the one _State captured at creation and exposes exactly the
+    # read surface of _StateReader — get, active_version, versions, history,
+    # snapshot_at and diff_at with the same KeyError/ValueError conditions,
+    # name ordering and deep-copy rules as the vault's own methods — and
+    # nothing else: no write, append or reload operation exists on it.  The
+    # view refers only to the captured state, never back to the vault
+    # instance, so it stays valid and unchanged for as long as the caller
+    # keeps it, across later writes, reloads and instance destruction.
+    def __init__(self,state):
+        self._state=state
+
 if __name__=="__main__":
     p=argparse.ArgumentParser(description="VersionedVault command line")
     p.add_argument("command",choices=("put","get","versions","active","history","snapshot","diff","verify","batch-if"))
