@@ -8,12 +8,15 @@ Usage:
     python conc_worker.py put ROOT COUNT PREFIX
     python conc_worker.py batch ROOT COUNT SIZE PREFIX
     python conc_worker.py cond ROOT NAME EXPECTED VALUE
+    python conc_worker.py batch-if ROOT ITEMS_JSON EXPECTED_JSON
     python conc_worker.py loop ROOT PREFIX
 
 cond exits 0 on success and 3 on VersionConflictError, printing the
-conflict's actual_version as one JSON document on stdout; any unexpected
-failure exits 1.  loop appends forever (or until it is killed) so the
-tests can verify that a dying writer releases the coordination.
+conflict's actual_version as one JSON document on stdout; batch-if prints
+the new versions as one JSON array on success (exit 0) or the conflict's
+actual_version on a VersionConflictError (exit 3); any unexpected failure
+exits 1.  loop appends forever (or until it is killed) so the tests can
+verify that a dying writer releases the coordination.
 """
 import json, sys
 from pathlib import Path
@@ -42,6 +45,15 @@ def main(argv):
         except VersionConflictError as exc:
             print(json.dumps(exc.actual_version))
             return 3
+        return 0
+    if mode=="batch-if":
+        items=json.loads(argv[2]); expected=json.loads(argv[3])
+        try:
+            versions=vault.put_batch_if_versions(items,expected)
+        except VersionConflictError as exc:
+            print(json.dumps([exc.name,exc.expected_version,exc.actual_version]))
+            return 3
+        print(json.dumps(versions))
         return 0
     if mode=="loop":
         prefix=argv[2]; index=0

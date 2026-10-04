@@ -307,16 +307,21 @@ class VersionedVault:
                 # already includes the new record.
                 lock_handle.close()
             self.reload(); return version
-    def _append_batch_locked(self,pairs):
-        # Shared append body of put_batch.  Every pair has already passed its
-        # side-effect-free validation (including the _build_line rehearsal), so
-        # nothing here can fail with TypeError; a corrupt chain still surfaces
-        # as ValueError from the locked revalidation before any byte is written.
-        # The in-process per-root lock plus the cross-platform file lock
-        # serializes the whole revalidate-append sequence against every other
-        # put/put_batch, as threads or as separate processes, on POSIX and on
-        # Windows alike, so no record can interleave into the batch's
-        # consecutive version range.
+    def _append_batch_locked(self,pairs,expected=None):
+        # Shared append body of put_batch (expected is None) and
+        # put_batch_if_versions (expected maps every pair name to the active
+        # version the caller based its update on, 0 meaning the name must not
+        # exist).  Every pair has already passed its side-effect-free
+        # validation (including the _build_line rehearsal), so nothing here can
+        # fail with TypeError; a corrupt chain still surfaces as ValueError from
+        # the locked revalidation before any byte is written, and a mismatched
+        # condition surfaces as VersionConflictError, likewise before any
+        # directory is created or any byte is written.  The in-process
+        # per-root lock plus the cross-platform file lock serializes the whole
+        # revalidate-check-append sequence against every other
+        # put/put_batch/put_if_version, as threads or as separate processes, on
+        # POSIX and on Windows alike, so no record can interleave into the
+        # batch's consecutive version range.
         with self._write_lock:
             if self.log.exists():
                 # Same binary read-only lock handle as _append_locked: the
@@ -324,8 +329,17 @@ class VersionedVault:
                 # detected without any filesystem side effect.
                 lock_handle=self.log.open("rb")
             else:
-                # Validation already rehearsed every record above, so reaching
-                # this point cannot fail; only now may the directory be created.
+                # Validation already rehearsed every record above.  For a plain
+                # batch reaching this point cannot fail; for a conditional
+                # batch a non-existent log means every name is actually absent,
+                # so the whole commit can only proceed when every expected
+                # version is 0.  Check that against the empty chain BEFORE
+                # creating anything, preserving the rule that a conditional
+                # miss never creates a directory.
+                if expected is not None:
+                    for name,_value in pairs:
+                        if expected[name]!=0:
+                            raise VersionConflictError(name,expected[name],None)
                 self.root.mkdir(parents=True,exist_ok=True)
                 lock_handle=self.log.open("ab")
             try:
@@ -334,8 +348,17 @@ class VersionedVault:
                     # the batch's versions are always derived from the chain
                     # found here because another process may have appended
                     # before the lock was taken.  A corrupt chain raises
-                    # ValueError before any write.
+                    # ValueError before any write.  A conditional batch then
+                    # compares every name, in input order, against the active
+                    # version found on disk: the first mismatch raises before
+                    # any byte is written and leaves self._state untouched.
                     state=self._load_log(self.log)
+                    if expected is not None:
+                        for name,_value in pairs:
+                            active=state.snapshot.get(name)
+                            actual_version=active["version"] if active is not None else None
+                            if (actual_version if actual_version is not None else 0)!=expected[name]:
+                                raise VersionConflictError(name,expected[name],actual_version)
                     base=len(state.records)
                     text="".join(self._build_line(name,value,base+index+1)
                                  for index,(name,value) in enumerate(pairs))
@@ -404,6 +427,61 @@ class VersionedVault:
         for index,(name,value) in enumerate(pairs):
             self._build_line(name,value,index+1)
         return self._append_batch_locked(pairs)
+    def put_batch_if_versions(self,items,expected_versions):
+        # Conditional counterpart of put_batch: append the batch as one commit
+        # only when every name's active version on disk still matches the
+        # version the caller based its update on; 0 means the name must
+        # currently not exist.  `items` obeys exactly the same shape rules as
+        # put_batch's (a non-empty list or tuple of unique (name, value)
+        # pairs), and `expected_versions` must be a dict whose string keys are
+        # exactly the batch names — no missing name, no extra name — each value
+        # a non-negative integer that is not a bool.  Every structural problem
+        # is a ValueError, every unstorable value a TypeError, and ALL of these
+        # checks — including a full JSON round-trip rehearsal of each record —
+        # run before any directory is created, any log is opened or any
+        # in-memory state changes, so a rejected batch leaves disk bytes, the
+        # snapshot and the next version number untouched (a fresh root is not
+        # created either).  The chain is then re-read and revalidated under
+        # the shared write coordination: only when every name matches are the
+        # records appended consecutively in input order and the same-ordered
+        # list of new global versions returned; the first mismatching name
+        # (compared in input order) raises the existing
+        # VersionConflictError(name, expected_version, actual_version) with
+        # actual_version None for a name that does not exist, writing nothing,
+        # creating no directory, and replacing neither the caller's snapshot
+        # nor the next version number.
+        if not isinstance(items,(list,tuple)) or not items:
+            raise ValueError("batch must be a non-empty list or tuple")
+        pairs=[]; seen=set()
+        for element in items:
+            if not isinstance(element,(list,tuple)) or len(element)!=2:
+                raise ValueError("batch elements must be (name, value) pairs")
+            name,value=element
+            if not isinstance(name,str) or not name:
+                raise ValueError("name required")
+            if name in seen:
+                raise ValueError("duplicate name in batch")
+            seen.add(name)
+            pairs.append((name,value))
+        if not isinstance(expected_versions,dict):
+            raise ValueError("expected_versions must be a name to version mapping")
+        if set(expected_versions)!=seen:
+            raise ValueError("expected_versions must cover exactly the batch names")
+        for name,_value in pairs:
+            if not self._is_nonneg_int(expected_versions[name]):
+                raise ValueError("expected versions must be non-negative integers")
+        # Same round-trip gate as put_batch, for every value up front: pure
+        # serializability/key checks first, then a full rehearsal of each
+        # record's exact bytes (versions are only placeholders here — the real
+        # ordinals are derived under the lock — but the storable rules are
+        # independent of them), so a reload-mismatching value fails here as
+        # TypeError before the filesystem is touched.
+        for name,value in pairs:
+            self._ensure_storable(value)
+        for index,(name,value) in enumerate(pairs):
+            self._build_line(name,value,index+1)
+        expected={name:expected_versions[name] for name,_value in pairs}
+        return self._append_batch_locked(pairs,expected)
     def put_if_version(self,name,expected_version,value):
         if not isinstance(name,str) or not name:
             raise ValueError("name required")
@@ -503,7 +581,7 @@ class VersionedVault:
         return result
 if __name__=="__main__":
     p=argparse.ArgumentParser(description="VersionedVault command line")
-    p.add_argument("command",choices=("put","get","versions","active","history","snapshot","diff","verify"))
+    p.add_argument("command",choices=("put","get","versions","active","history","snapshot","diff","verify","batch-if"))
     p.add_argument("--root",default="vault")
     p.add_argument("--name")
     p.add_argument("--value",help="write the argument verbatim as a string; mutually exclusive with --value-json")
@@ -512,6 +590,13 @@ if __name__=="__main__":
                         "value (objects, arrays, numbers, booleans and null keep their type); "
                         "mutually exclusive with --value: giving both, or passing text that is "
                         "not a complete JSON document, exits with status 1 without appending a record")
+    p.add_argument("--items-json",dest="items_json",
+                   help="only for batch-if: one complete JSON document holding a non-empty "
+                        "array of [name, value] pairs with unique names")
+    p.add_argument("--expected-versions-json",dest="expected_versions_json",
+                   help="only for batch-if: one complete JSON document holding an object "
+                        "mapping every batch name to its expected active version, a "
+                        "non-negative integer (0 means the name must not exist)")
     p.add_argument("--version",
                    help="record/global sequence number: selects one named version for get, "
                         "or a whole-repository point in time (0 = empty snapshot) for snapshot")
@@ -540,10 +625,40 @@ if __name__=="__main__":
             if (a.name is not None or a.value is not None or a.value_json is not None
                     or a.version is not None or a.if_version is not None
                     or a.from_version is not None or a.to_version is not None
+                    or a.items_json is not None or a.expected_versions_json is not None
                     or a.json_output):
                 raise SystemExit(1)
             print(json.dumps(VersionedVault.audit(a.root),sort_keys=True))
             raise SystemExit(0)
+        parsed_items=parsed_expected=None
+        if a.command=="batch-if":
+            # Both JSON documents are required; validate their presence and
+            # parse each as exactly one complete document BEFORE the vault is
+            # constructed (constructing it reads the log), so a missing option
+            # or an incomplete/ambiguous document takes the unified failure
+            # path without touching disk.  The mapping additionally rejects a
+            # JSON object that repeats a member, which plain parsing would
+            # silently collapse.  Every remaining rule — pair shape, unique
+            # names, exactly matching name sets, non-negative integer
+            # versions, value storability, precondition conflicts and a
+            # corrupt chain — is enforced by put_batch_if_versions itself
+            # below, whose ValueError, TypeError and VersionConflictError all
+            # reach the shared handler (status 1, empty stdout).
+            if a.items_json is None or a.expected_versions_json is None:
+                raise SystemExit(1)
+            def reject_duplicate_keys(pairs):
+                seen=set()
+                for key,_item in pairs:
+                    if key in seen:
+                        raise ValueError("duplicate object key")
+                    seen.add(key)
+                return dict(pairs)
+            try:
+                parsed_items=json.loads(a.items_json)
+                parsed_expected=json.loads(a.expected_versions_json,
+                                           object_pairs_hook=reject_duplicate_keys)
+            except (ValueError,TypeError):
+                raise SystemExit(1)
         v=VersionedVault(a.root)
         if a.command=="put":
             # Checked by hand instead of an argparse mutually-exclusive group so
@@ -572,6 +687,16 @@ if __name__=="__main__":
                 print(v.put_if_version(a.name,expected,value))
             else:
                 print(v.put(a.name,value))
+        elif a.command=="batch-if":
+            # On success stdout gets exactly one line accepted by json.loads —
+            # the new global versions in input order — and the process exits 0.
+            # Every failure (option, JSON document, duplicate or mismatching
+            # names, boolean or fractional versions, unstorable values,
+            # VersionConflictError, corrupt vault) reaches the shared handler:
+            # status 1 with nothing printed, no partial commit and the
+            # in-process snapshot left as it was.
+            result=v.put_batch_if_versions(parsed_items,parsed_expected)
+            print(json.dumps(result))
         elif a.command=="get":
             if a.version is None:
                 value=v.get(a.name)

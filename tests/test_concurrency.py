@@ -186,6 +186,86 @@ class ConditionalContentionTest(ConcurrencyCase):
         # no directory, no log, no version consumed
         self.assertFalse(self.root.exists())
 
+class ConditionalBatchContentionTest(ConcurrencyCase):
+    def test_contending_threads_at_most_one_batch_commits(self):
+        base=VersionedVault(self.root)
+        self.assertEqual(base.put("shared","base"),1)
+        outcomes=[]
+        def body(tid):
+            vault=VersionedVault(self.root)
+            before=vault.versions()
+            try:
+                versions=vault.put_batch_if_versions(
+                    [["shared","t%d"%tid],["new-%d"%tid,tid]],
+                    {"shared":1,"new-%d"%tid:0})
+                outcomes.append(("ok",versions))
+            except VersionConflictError as exc:
+                outcomes.append(("conflict",exc.name,exc.expected_version,
+                                 exc.actual_version))
+                # a failed call must not have touched the caller's snapshot
+                self.assertEqual(vault.versions(),before)
+        self.run_threads([lambda t=t: body(t) for t in range(6)])
+        wins=[o for o in outcomes if o[0]=="ok"]
+        losses=[o for o in outcomes if o[0]=="conflict"]
+        self.assertEqual(len(wins),1,outcomes)
+        # the single winning batch occupies one consecutive version range
+        self.assertEqual(wins[0][1],[2,3])
+        self.assertEqual(len(losses),5)
+        for _,name,expected,actual in losses:
+            # every loser based itself on "shared"==1 and saw it at version 2
+            self.assertEqual(name,"shared")
+            self.assertEqual((expected,actual),(1,2))
+        # losers wrote no bytes and consumed no version numbers; the winner's
+        # two records stayed consecutive
+        history=VersionedVault(self.root).history()
+        self.assertEqual([r["version"] for r in history],[1,2,3])
+        self.assertEqual(history[1]["name"],"shared")
+        self.assertTrue(history[2]["name"].startswith("new-"))
+
+    def test_contending_processes_at_most_one_batch_commits(self):
+        vault=VersionedVault(self.root)
+        self.assertEqual(vault.put("shared","base"),1)
+        arglists=[["batch-if",self.root,
+                   json.dumps([["shared","w%d"%i],["new-%d"%i,i]]),
+                   json.dumps({"shared":1,"new-%d"%i:0})]
+                  for i in range(8)]
+        results=self.start_workers(arglists)
+        wins=[r for r in results if r[0]==0]
+        losses=[r for r in results if r[0]==3]
+        self.assertEqual(len(wins),1,[r[2] for r in results if r[0] not in (0,3)])
+        self.assertEqual(json.loads(wins[0][1]),[2,3])
+        self.assertEqual(len(losses),7)
+        for rc,out,err in losses:
+            name,expected,actual=json.loads(out)
+            self.assertEqual((name,expected,actual),("shared",1,2))
+        history=VersionedVault(self.root).history()
+        self.assertEqual([r["version"] for r in history],[1,2,3])
+        self.assertEqual(VersionedVault(self.root).active_version("shared"),2)
+
+    def test_all_zero_contention_on_empty_vault_creates_nothing_for_losers(self):
+        self.assertFalse(self.root.exists())
+        # Only one of the contending batches can create both names; every
+        # other process finds the names taken and exits 3 without a directory
+        # ever existing on its miss path.
+        arglists=[["batch-if",self.root,
+                   json.dumps([["a",i],["b",i]]),
+                   json.dumps({"a":0,"b":0})]
+                  for i in range(6)]
+        results=self.start_workers(arglists)
+        wins=[r for r in results if r[0]==0]
+        losses=[r for r in results if r[0]==3]
+        self.assertEqual(len(wins),1,[r[2] for r in results if r[0] not in (0,3)])
+        self.assertEqual(json.loads(wins[0][1]),[1,2])
+        self.assertEqual(len(losses),5)
+        for rc,out,err in losses:
+            name,expected,actual=json.loads(out)
+            # every batch lists "a" first, and once any batch committed both
+            # names, the first name to mismatch is always "a" at version 1
+            self.assertEqual((name,expected,actual),("a",0,1))
+        history=VersionedVault(self.root).history()
+        self.assertEqual([(r["version"],r["name"]) for r in history],
+                         [(1,"a"),(2,"b")])
+
 class RecoveryTest(ConcurrencyCase):
     def test_coordination_released_after_every_failure_kind(self):
         vault=VersionedVault(self.root)
@@ -422,6 +502,112 @@ class CommandLineRegressionTest(ConcurrencyCase):
                                   "--value-json","{}").returncode,1)
         self.assertEqual(self.cli("snapshot","--version","-1").returncode,1)
         self.assertEqual(self.cli("diff","--from-version","2").returncode,1)
+
+    def test_batch_if_command_outputs_and_failures(self):
+        r=self.cli("put","--name","a","--value-json","1")
+        self.assertEqual((r.returncode,r.stdout),(0,"1\n"),r.stderr)
+        # successful conditional batch: one json.loads-able array line
+        r=self.cli("batch-if",
+                   "--items-json",'[["b", 2], ["a", [1, 2]]]',
+                   "--expected-versions-json",'{"b": 0, "a": 1}')
+        self.assertEqual((r.returncode,r.stdout),(0,"[2, 3]\n"),r.stderr)
+        self.assertEqual(json.loads(r.stdout),[2,3])
+        # conflict: status 1, empty stdout, no extra records
+        r=self.cli("batch-if",
+                   "--items-json",'[["a", 9]]',
+                   "--expected-versions-json",'{"a": 1}')
+        self.assertEqual((r.returncode,r.stdout),(1,""))
+        # create-only expectation on a now existing name also fails
+        r=self.cli("batch-if",
+                   "--items-json",'[["b", 9]]',
+                   "--expected-versions-json",'{"b": 0}')
+        self.assertEqual((r.returncode,r.stdout),(1,""))
+        # still only the three records from the successful calls
+        self.assertEqual(len(VersionedVault(self.root).history()),3)
+        # missing options
+        self.assertEqual(self.cli("batch-if",
+                                  "--items-json",'[["c",1]]').returncode,1)
+        self.assertEqual(self.cli("batch-if",
+                                  "--expected-versions-json",'{"c":0}').returncode,1)
+        # JSON that is not one complete document
+        for bad_items in ('', '[["c",1]', 'nope', '[["c",1]]extra',
+                          '[[\"c\",1]] {}'):
+            r=self.cli("batch-if","--items-json",bad_items,
+                       "--expected-versions-json",'{"c":0}')
+            self.assertEqual((r.returncode,r.stdout),(1,""),repr(bad_items))
+        for bad_expected in ('', '{"c":', 'nope', '{"c":0} {}'):
+            r=self.cli("batch-if","--items-json",'[["c",1]]',
+                       "--expected-versions-json",bad_expected)
+            self.assertEqual((r.returncode,r.stdout),(1,""),repr(bad_expected))
+        # boolean, fractional, negative and string versions are all rejected
+        for bad_version in ("true","false","1.0","-1",'"0"','null'):
+            r=self.cli("batch-if","--items-json",'[["c",1]]',
+                       "--expected-versions-json",'{"c":%s}'%bad_version)
+            self.assertEqual((r.returncode,r.stdout),(1,""),bad_version)
+        # duplicate names in items, mismatching name sets
+        r=self.cli("batch-if","--items-json",'[["c",1],["c",2]]',
+                   "--expected-versions-json",'{"c":0}')
+        self.assertEqual((r.returncode,r.stdout),(1,""))
+        r=self.cli("batch-if","--items-json",'[["c",1]]',
+                   "--expected-versions-json",'{"c":0,"d":0}')
+        self.assertEqual((r.returncode,r.stdout),(1,""))
+        r=self.cli("batch-if","--items-json",'[["c",1],["d",2]]',
+                   "--expected-versions-json",'{"c":0}')
+        self.assertEqual((r.returncode,r.stdout),(1,""))
+        # malformed item shape
+        r=self.cli("batch-if","--items-json",'{"c":1}',
+                   "--expected-versions-json",'{"c":0}')
+        self.assertEqual((r.returncode,r.stdout),(1,""))
+        r=self.cli("batch-if","--items-json",'[]',
+                   "--expected-versions-json",'{}')
+        self.assertEqual((r.returncode,r.stdout),(1,""))
+        # a repeated JSON object member in the mapping is ambiguous: reject
+        r=self.cli("batch-if","--items-json",'[["c",1]]',
+                   "--expected-versions-json",'{"c":0,"c":1}')
+        self.assertEqual((r.returncode,r.stdout),(1,""))
+        # no failed call created version 4 or name c
+        self.assertEqual([r["version"] for r in VersionedVault(self.root).history()],
+                         [1,2,3])
+        # the corrected call finally succeeds
+        r=self.cli("batch-if","--items-json",'[["c", {"ok": true}]]',
+                   "--expected-versions-json",'{"c":0}')
+        self.assertEqual((r.returncode,r.stdout),(0,"[4]\n"),r.stderr)
+        self.assertEqual(json.loads(r.stdout),[4])
+        # duplicate members inside a value collapse under plain JSON parsing,
+        # exactly as the existing put --value-json rule does
+        r=self.cli("batch-if","--items-json",'[["d",{"x":1,"x":2}]]',
+                   "--expected-versions-json",'{"d":0}')
+        self.assertEqual((r.returncode,r.stdout),(0,"[5]\n"),r.stderr)
+        self.assertEqual(VersionedVault(self.root).get("d"),{"x":2})
+
+    def test_batch_if_on_fresh_root_miss_creates_nothing(self):
+        fresh=Path(self._tmp.name)/"fresh-batch-if"
+        self.assertFalse(fresh.exists())
+        r=subprocess.run([sys.executable,str(APP),"--root",str(fresh),"batch-if",
+                          "--items-json",'[["a",1]]',
+                          "--expected-versions-json",'{"a":1}'],
+                         capture_output=True,text=True,timeout=60)
+        self.assertEqual((r.returncode,r.stdout),(1,""))
+        self.assertFalse(fresh.exists())
+
+    def test_batch_if_rejected_by_verify_option_guard(self):
+        # verify still accepts only --root: the new batch-if options fail it
+        # the same way every other extra option does
+        for extra in (("--items-json",'[]'),
+                      ("--expected-versions-json",'{}')):
+            r=self.cli("verify",*extra)
+            self.assertEqual((r.returncode,r.stdout),(1,""),extra)
+
+    def test_batch_if_on_corrupt_log_exits_1_without_output_or_writes(self):
+        vault=VersionedVault(self.root)
+        vault.put("a",1)
+        before=self.log.read_bytes()
+        with self.log.open("a",encoding="utf-8") as f:
+            f.write("not-json\n")
+        r=self.cli("batch-if","--items-json",'[["a",2]]',
+                   "--expected-versions-json",'{"a":1}')
+        self.assertEqual((r.returncode,r.stdout),(1,""))
+        self.assertEqual(self.log.read_bytes(),before+b"not-json\n")
 
     def test_verify_outputs_one_ordered_line_and_empty_cases(self):
         fresh=Path(self._tmp.name)/"fresh"

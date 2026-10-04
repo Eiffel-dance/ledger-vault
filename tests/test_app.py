@@ -1,7 +1,7 @@
 import json, math, unittest
 from pathlib import Path
 import app
-from app import VersionedVault
+from app import VersionedVault, VersionConflictError
 
 class _VaultCase(unittest.TestCase):
     def setUp(self):
@@ -278,6 +278,143 @@ class PutBatchTest(_VaultCase):
         self.assertEqual(self.log_bytes(),good+b"not-json\n")
         self.write_log(good.decode())
         self.assertEqual(self.vault.put_batch([["b",2],["c",3]]),[2,3])
+
+class PutBatchIfVersionsTest(_VaultCase):
+    def test_success_mixes_existing_names_and_creates_in_order(self):
+        self.assertEqual(self.vault.put("a",0),1)
+        result=self.vault.put_batch_if_versions(
+            [["b",1],("c",[1,2]),("a",{"x":True})],
+            {"a":1,"b":0,"c":0})
+        self.assertEqual(result,[2,3,4])
+        self.assertEqual(self.vault.get("b"),1)
+        self.assertEqual(self.vault.get("c"),[1,2])
+        self.assertEqual(self.vault.get("a"),{"x":True})
+        self.assertEqual(self.vault.active_version("a"),4)
+        self.assertEqual([r["version"] for r in self.vault.history()],[1,2,3,4])
+        fresh=VersionedVault(self.root)
+        self.assertEqual(fresh.versions(),self.vault.versions())
+        self.assertEqual(fresh.history(),self.vault.history())
+    def test_all_zero_expectations_create_on_empty_vault(self):
+        target=Path(self._tmp.name)/"fresh_cond_batch"
+        w=VersionedVault(target)
+        self.assertFalse(target.exists())
+        self.assertEqual(w.put_batch_if_versions((("k","v"),),{"k":0}),[1])
+        self.assertEqual(w.get("k"),"v")
+        self.assertTrue((target/"versions.jsonl").exists())
+    def test_zero_expectation_on_existing_name_conflicts(self):
+        self.vault.put("a",1)
+        with self.assertRaises(VersionConflictError) as cm:
+            self.vault.put_batch_if_versions([["a",2],["b",3]],{"a":0,"b":0})
+        self.assertEqual((cm.exception.name,cm.exception.expected_version,
+                          cm.exception.actual_version),("a",0,1))
+    def test_positive_expectation_on_missing_name_reports_none(self):
+        with self.assertRaises(VersionConflictError) as cm:
+            self.vault.put_batch_if_versions([["a",1]],{"a":3})
+        self.assertEqual((cm.exception.name,cm.exception.expected_version,
+                          cm.exception.actual_version),("a",3,None))
+    def test_first_conflict_in_input_order_is_reported(self):
+        self.vault.put("a",1)  # b and c absent
+        with self.assertRaises(VersionConflictError) as cm:
+            self.vault.put_batch_if_versions(
+                [["a",9],["b",1],["c",0]],{"a":9,"b":1,"c":0})
+        self.assertEqual(cm.exception.name,"a")
+        self.assertEqual((cm.exception.expected_version,cm.exception.actual_version),(9,1))
+        with self.assertRaises(VersionConflictError) as cm:
+            self.vault.put_batch_if_versions(
+                [["c",0],["b",1],["a",1]],{"c":0,"b":1,"a":1})
+        self.assertEqual(cm.exception.name,"b")
+        self.assertEqual((cm.exception.expected_version,cm.exception.actual_version),(1,None))
+    def test_conflict_on_fresh_root_creates_nothing(self):
+        target=Path(self._tmp.name)/"never_created_cond"
+        w=VersionedVault(target)
+        self.assertFalse(target.exists())
+        with self.assertRaises(VersionConflictError):
+            w.put_batch_if_versions([["a",1],["b",2]],{"a":1,"b":0})
+        self.assertFalse(target.exists())
+        self.assertFalse((target/"versions.jsonl").exists())
+    def test_conflict_leaves_bytes_snapshot_and_next_version(self):
+        self.assertEqual(self.vault.put("a",1),1)
+        before_versions=self.vault.versions()
+        before_bytes=self.log_bytes()
+        with self.assertRaises(VersionConflictError):
+            self.vault.put_batch_if_versions([["a",2],["b",3]],{"a":9,"b":0})
+        with self.assertRaises(VersionConflictError):
+            self.vault.put_batch_if_versions([["b",3]],{"b":1})
+        self.assertEqual(self.vault.versions(),before_versions)
+        self.assertEqual(self.log_bytes(),before_bytes)
+        # no version number consumed: the next plain append is version 2
+        self.assertEqual(self.vault.put("b",3),2)
+        # and a corrected conditional batch then succeeds as one commit
+        self.assertEqual(
+            self.vault.put_batch_if_versions([["a",4],["c",5]],{"a":1,"c":0}),
+            [3,4])
+    def test_stale_expectation_after_another_name_moved_still_conflicts(self):
+        self.vault.put("a",1); self.vault.put("a",2)
+        with self.assertRaises(VersionConflictError) as cm:
+            self.vault.put_batch_if_versions([["a",3]],{"a":1})
+        self.assertEqual((cm.exception.expected_version,cm.exception.actual_version),(1,2))
+    def test_bad_items_shapes_are_value_errors(self):
+        bad_items=([],(),None,"ab",[["a",1],["a",2]],[["",1]],[[None,1]],
+                   [[1,1]],[["a"]],[["a",1,2]],["ab"],[["a",1],"bc"])
+        for items in bad_items:
+            with self.assertRaises(ValueError,msg=repr(items)):
+                self.vault.put_batch_if_versions(items,{"a":0})
+        self.assertFalse(self.root.exists())
+    def test_bad_expected_mapping_shapes_are_value_errors(self):
+        bad_mappings=(None,[],(),[("a",0)],"{}",
+                      {}, {"a":0,"b":0}, {"b":0},
+                      {"a":True}, {"a":False}, {"a":1.0}, {"a":-1},
+                      {"a":"0"}, {"a":None}, {"a":0.0})
+        for mapping in bad_mappings:
+            with self.assertRaises(ValueError,msg=repr(mapping)):
+                self.vault.put_batch_if_versions([["a",1]],mapping)
+        # missing/extra names with a two-item batch
+        with self.assertRaises(ValueError):
+            self.vault.put_batch_if_versions([["a",1],["b",2]],{"a":0})
+        with self.assertRaises(ValueError):
+            self.vault.put_batch_if_versions([["a",1],["b",2]],{"a":0,"b":0,"c":0})
+        self.assertFalse(self.root.exists())
+    def test_validation_runs_before_any_filesystem_access(self):
+        target=Path(self._tmp.name)/"cond_batch_validation"
+        w=VersionedVault(target)
+        # malformed mapping despite a perfectly valid batch
+        with self.assertRaises(ValueError):
+            w.put_batch_if_versions([["a",1]],{"a":0,"b":0})
+        self.assertFalse(target.exists())
+        # unstorable value: TypeError and no directory
+        for bad_value in ({1:"x"},(1,2),{"a":(2,3)},object()):
+            with self.assertRaises(TypeError,msg=repr(bad_value)):
+                w.put_batch_if_versions([["ok",1],["bad",bad_value]],
+                                        {"ok":0,"bad":0})
+        self.assertFalse(target.exists())
+        self.assertEqual(w.put("ok",1),1)
+    def test_conflict_does_not_replace_snapshot_when_disk_changed(self):
+        # The caller's in-memory snapshot stays as loaded even though another
+        # process/writer moved the name on disk; the conflict reads disk but
+        # publishes nothing.
+        other=VersionedVault(self.root)
+        other.put("a",1)
+        self.assertEqual(self.vault.reload(),1)
+        other.put("a",2)
+        before=self.vault.versions()
+        before_bytes=self.log_bytes()
+        with self.assertRaises(VersionConflictError):
+            self.vault.put_batch_if_versions([["a",3]],{"a":1})
+        self.assertEqual(self.vault.versions(),before)
+        self.assertEqual(self.vault.active_version("a"),1)
+        # the failed call wrote nothing and did not reload the newer state
+        self.assertEqual(self.log_bytes(),before_bytes)
+    def test_corrupt_log_blocks_conditional_batch_without_appending(self):
+        self.vault.put("a",1)
+        before=self.vault.versions()
+        good=self.log_bytes()
+        self.write_log(good.decode()+"not-json\n")
+        with self.assertRaisesRegex(ValueError,r"^invalid vault record$"):
+            self.vault.put_batch_if_versions([["a",2]],{"a":1})
+        self.assertEqual(self.vault.versions(),before)
+        self.assertEqual(self.log_bytes(),good+b"not-json\n")
+        self.write_log(good.decode())
+        self.assertEqual(self.vault.put_batch_if_versions([["a",2]],{"a":1}),[2])
 
 class AuditTest(_VaultCase):
     def audit(self):
